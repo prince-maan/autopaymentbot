@@ -1,0 +1,6 @@
+pyTelegramBotAPI
+Flask
+Pillow
+qrcode
+pymongo
+dnspython
