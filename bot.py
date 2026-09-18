@@ -25,7 +25,7 @@ from telebot.types import (
 )
 
 # ==========================================
-# 🛑 ENVIRONMENT VARIABLES (Render से लेगा)
+# 🛑 ENVIRONMENT VARIABLES (Render / .env से लेगा)
 # ==========================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGO_URI = os.environ.get("MONGO_URI")
@@ -58,7 +58,7 @@ if not BOT_TOKEN or not MONGO_URI or not UPI_ID or not SMS_HOOK_SECRET:
     print("❌ ERROR: Required Environment Variables are missing.")
     sys.exit(1)
 
-# 🚀 THREAD POOL OPTIMIZATION: Handles 20 simultaneous users without hanging
+# 🚀 THREAD POOL OPTIMIZATION
 bot = telebot.TeleBot(BOT_TOKEN, num_threads=20)
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -729,47 +729,23 @@ def start_command(message):
             c = get_cached_course(offer["target_course_id"])
             if c:
                 def _sc():
-                    wait_msg = None
-                    try: 
-                        bot.send_chat_action(user_id, 'upload_photo')
-                        wait_msg = bot.send_message(user_id, "⏳ <i>Loading... Just a second!</i>", parse_mode="HTML")
-                    except: pass
                     send_course_to_user(user_id, c)
-                    if wait_msg:
-                        try: bot.delete_message(user_id, wait_msg.message_id)
-                        except: pass
                 threading.Thread(target=_sc, daemon=True).start()
             else: send_custom_start_menu(user_id)
         else: send_custom_start_menu(user_id)
 
     elif param.startswith("b_"):
         def _sb():
-            wait_msg = None
-            try: 
-                bot.send_chat_action(user_id, 'typing')
-                wait_msg = bot.send_message(user_id, "⏳ <i>Loading batch details...</i>", parse_mode="HTML")
-            except: pass
             batch = batches_col.find_one({"batch_id": param})
             if batch: send_batch_to_user(user_id, batch)
             else: bot.send_message(user_id, "❌ <b>This link has expired.</b>", parse_mode="HTML", msg_type="general")
-            if wait_msg:
-                try: bot.delete_message(user_id, wait_msg.message_id)
-                except: pass
         threading.Thread(target=_sb, daemon=True).start()
 
     elif param.startswith("c_"):
         def _sc():
-            wait_msg = None
-            try: 
-                bot.send_chat_action(user_id, 'upload_photo')
-                wait_msg = bot.send_message(user_id, "⏳ <i>Loading course details...</i>", parse_mode="HTML")
-            except: pass
             course = get_cached_course(param)
             if course: send_course_to_user(user_id, course)
             else: bot.send_message(user_id, "❌ <b>This link is not available.</b>", parse_mode="HTML", msg_type="general")
-            if wait_msg:
-                try: bot.delete_message(user_id, wait_msg.message_id)
-                except: pass
         threading.Thread(target=_sc, daemon=True).start()
 
     elif param.startswith("f_"):
@@ -1236,7 +1212,6 @@ def handle_buttons(call):
     msg_id = call.message.message_id
     data = call.data
 
-    # 1. ALWAYS ALLOW CLOSE MSG (Even in rate limit or maintenance)
     if data == "close_msg":
         try: bot.delete_message(chat_id, msg_id)
         except Exception: pass
@@ -1244,29 +1219,22 @@ def handle_buttons(call):
         except Exception: pass
         return
 
-    # 2. MAINTENANCE CHECK
     if is_maintenance_mode() and chat_id != ADMIN_ID:
         try: bot.answer_callback_query(call.id, "⚠️ Bot is currently under maintenance. Please try again later.", show_alert=True)
         except Exception: pass
         return
 
-    # 3. RATE LIMITER
     if not check_rate_limit(chat_id, 1.2): 
         try: bot.answer_callback_query(call.id, "⚠️ Please slow down! Don't click too fast.", show_alert=False)
         except Exception: pass
         return
 
-    # 🚀 4. ZERO-DELAY FIX: Answer Callback Query IMMEDIATELY
     def bg_answer(text=None, alert=False):
         try: bot.answer_callback_query(call.id, text=text, show_alert=alert)
         except Exception: pass
 
     threading.Thread(target=bg_answer, daemon=True).start()
     register_activity(chat_id, msg_id, "general")
-
-    # -------------------------------------------------------------
-    # CUSTOM NOTIFICATIONS / HEAVY LOGIC IN BACKGROUND THREADS
-    # -------------------------------------------------------------
 
     if data.startswith("paydone_"):
         def _bg_paydone():
@@ -1648,32 +1616,14 @@ def handle_buttons(call):
         t = data.replace("mainmenu_", "")
         if t.startswith("c_"):
             def _bg_c():
-                wait_msg = None
-                try: 
-                    bot.send_chat_action(chat_id, 'upload_photo')
-                    wait_msg = bot.send_message(chat_id, "⏳ <i>Loading course details... Just a second!</i>", parse_mode="HTML")
-                except: pass
-                
                 c = get_cached_course(t)
                 if c: send_course_to_user(chat_id, c)
-                
-                if wait_msg:
-                    try: bot.delete_message(chat_id, wait_msg.message_id)
-                    except: pass
             threading.Thread(target=_bg_c, daemon=True).start()
             
         elif t.startswith("b_"):
             def _bg_b():
-                wait_msg = None
-                try: wait_msg = bot.send_message(chat_id, "⏳ <i>Loading batch details... Just a second!</i>", parse_mode="HTML")
-                except: pass
-                
                 b = batches_col.find_one({"batch_id": t})
                 if b: send_batch_to_user(chat_id, b)
-                
-                if wait_msg:
-                    try: bot.delete_message(chat_id, wait_msg.message_id)
-                    except: pass
             threading.Thread(target=_bg_b, daemon=True).start()
 
     elif data == "bc_done":
@@ -2228,7 +2178,7 @@ def global_memory_cleanup():
             for k in keys_to_del: all_orders_cache.pop(k, None)
             cool_keys = [uid for uid, t in user_cooldowns.items() if now - t > 3600]
             for k in cool_keys: user_cooldowns.pop(k, None)
-            gc.collect() # 🧹 Keeps Render RAM Strictly Low (Fixes Crashing)
+            gc.collect() 
         except Exception: pass
 
 def restore_pending_orders():
@@ -2241,13 +2191,12 @@ def restore_pending_orders():
         else:
             threading.Thread(target=expire_qr, args=(chat_id, order.get("qr_msg_id"), order["course_id"], amt_key, order_id), daemon=True).start()
 
-# 🛡️ ANTI-CONFLICT POLLING FIX (Fixes Error 409 and Sleep loops)
+# 🛡️ ANTI-CONFLICT POLLING FIX
 def start_polling():
     time.sleep(2)
     while True:
         try:
             bot.remove_webhook()
-            # Non-blocking, error-ignoring polling loop
             bot.infinity_polling(timeout=20, long_polling_timeout=15, skip_pending=True, logger_level=None)
         except Exception:
             time.sleep(5)
