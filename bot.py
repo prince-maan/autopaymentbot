@@ -40,9 +40,6 @@ SMS_HOOK_SECRET = os.environ.get("SMS_HOOK_SECRET")
 CHAT_LINK = os.environ.get("CHAT_LINK")
 INTERNATIONAL_LINK = os.environ.get("INTERNATIONAL_LINK")
 
-# आपका InfinityFree डोमेन सीधे डिफ़ॉल्ट सेट है (Env में कुछ डालने की ज़रूरत नहीं)
-PAY_REDIRECT_URL = os.environ.get("PAY_REDIRECT_URL", "https://darkrublx.ct.ws/index.html")
-
 PROTECT_CONTENT = os.environ.get("PROTECT_CONTENT", "False").strip().lower() == "true"
 QR_EXPIRY_SECONDS = int(os.environ.get("QR_EXPIRY_MINUTES", "10")) * 60
 STALE_ORDER_SECONDS = int(os.environ.get("STALE_ORDER_HOURS", "24")) * 3600
@@ -1487,13 +1484,8 @@ def handle_buttons(call):
 
                 qr_img_bio, clean_amt = generate_upi_qr(amt_key, order_id)
                 inv = f"👤 <b>User:</b> {call.from_user.first_name}\n🆔 <b>Order:</b> <code>{order_id}</code>\n💰 <b>Amount:</b> ₹{clean_amt}\n⚠️ <b>Please pay the exact amount shown.</b>\n⏳ <i>QR will expire in {QR_EXPIRY_SECONDS // 60} minutes.</i>"
-                
-                # डायनामिक ऑटो-पेमेंट लिंक (सटीक clean_amt के साथ)
-                direct_pay_link = f"{PAY_REDIRECT_URL}?am={clean_amt}&tn=Order_{order_id}"
 
                 m = InlineKeyboardMarkup()
-                # 2. छोटा और सटीक UPI ऐप बटन
-                m.row(InlineKeyboardButton("📱 GPay / PhonePe / Paytm", url=direct_pay_link))
                 if CHAT_LINK: m.row(InlineKeyboardButton("💬 Chat with Me", url=CHAT_LINK))
                 m.row(InlineKeyboardButton("❌ Cancel Order", callback_data=f"cancel_order_{order_id}"))
                 
