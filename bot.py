@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 
 from flask import Flask, request, jsonify, Response
 from functools import wraps
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import pymongo
 import qrcode
 import telebot
@@ -254,35 +254,64 @@ def tracked_send_document(chat_id, *args, **kwargs):
 bot.send_document = tracked_send_document
 bot.send_media_group = orig_send_media_group
 
+# ==========================================
+# 📸 QR CODE & CUSTOM FRAME GENERATOR
+# ==========================================
 def generate_upi_qr(amount, order_id):
     clean_amt = re.sub(r"[^\d.]", "", str(amount))
     upi_url = f"upi://pay?pa={UPI_ID}&pn={MERCHANT_NAME}&am={clean_amt}&cu=INR&tn=Order_{order_id}"
-    qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=2)
+    
+    # 1. बेसिक QR कोड बनाएं
+    qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=1)
     qr.add_data(upi_url)
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGBA")
-    w, h = qr_img.size
-    box_w, box_h = int(w * 0.28), int(int(w * 0.28) * 0.40)
-    box_x, box_y = (w - box_w) // 2, (h - box_h) // 2
-    draw = ImageDraw.Draw(qr_img)
-    draw.rounded_rectangle([box_x, box_y, box_x + box_w, box_y + box_h], radius=6, fill="#ffffff", outline="#0b1329", width=2)
-    lw = max(2, int(box_h * 0.12))
-    let_w, let_h, gap = box_w * 0.18, box_h * 0.45, box_w * 0.08
-    start_x = box_x + (box_w - ((let_w * 2) + gap * 2 + lw)) // 2
-    start_y = box_y + (box_h - let_h) // 2
-    u_x = start_x
-    draw.line([(u_x, start_y), (u_x, start_y + let_h)], fill="#097939", width=lw)
-    draw.line([(u_x, start_y + let_h), (u_x + let_w, start_y + let_h)], fill="#097939", width=lw)
-    draw.line([(u_x + let_w, start_y + let_h), (u_x + let_w, start_y)], fill="#097939", width=lw)
-    p_x = u_x + let_w + gap
-    draw.line([(p_x, start_y), (p_x, start_y + let_h)], fill="#F37021", width=lw)
-    draw.line([(p_x, start_y), (p_x + let_w, start_y)], fill="#F37021", width=lw)
-    draw.line([(p_x + let_w, start_y), (p_x + let_w, start_y + let_h // 2)], fill="#F37021", width=lw)
-    draw.line([(p_x + let_w, start_y + let_h // 2), (p_x, start_y + let_h // 2)], fill="#F37021", width=lw)
-    i_x = p_x + let_w + gap + lw // 2
-    draw.line([(i_x, start_y), (i_x, start_y + let_h)], fill="#1a73e8", width=lw)
+    
+    try:
+        # 2. आपकी बनाई हुई डिज़ाइन (frame.png) लोड करें
+        background = Image.open("frame.png").convert("RGBA")
+        bg_w, bg_h = background.size
+        
+        # 3. QR कोड को फ्रेम के हिसाब से छोटा/बड़ा करें (फ्रेम की चौड़ाई का 60%)
+        qr_size = int(bg_w * 0.60)
+        qr_img = qr_img.resize((qr_size, qr_size), Image.Resampling.LANCZOS)
+        
+        # 4. QR कोड को फ्रेम के बीच में सेट करने की जगह (X, Y)
+        # अगर QR थोड़ा ऊपर-नीचे हो, तो 0.22 वाले नंबर को कम या ज्यादा करके सेट कर लें
+        qr_x = (bg_w - qr_size) // 2
+        qr_y = int(bg_h * 0.22) 
+        
+        # फ्रेम पर QR पेस्ट कर दें
+        background.paste(qr_img, (qr_x, qr_y))
+        
+        # 5. अमाउंट लिखना
+        draw = ImageDraw.Draw(background)
+        amt_text = f"{clean_amt}"
+        
+        # फॉन्ट का साइज़ सेट करने की कोशिश (ताकि छोटा न दिखे)
+        try:
+            # अगर सर्वर पर कोई फॉन्ट फाइल नहीं है, तो डिफॉल्ट फॉन्ट लेगा
+            font = ImageFont.truetype("arial.ttf", int(bg_h * 0.05)) 
+        except:
+            font = ImageFont.load_default()
+            
+        # टेक्स्ट की जगह (X, Y) - अगर अमाउंट थोड़ा दाएं-बाएं हो, तो इसे बदल लें
+        text_x = int(bg_w * 0.58)  
+        text_y = int(bg_h * 0.86)  
+        
+        # अमाउंट को नीले या काले रंग में लिख दें
+        draw.text((text_x, text_y), amt_text, fill="#1D3B70", font=font)
+        
+        # फाइनल इमेज को सेव करने के लिए तैयार करें
+        final_img = background
+        
+    except Exception as e:
+        print(f"⚠️ Frame Error: {e}")
+        # अगर frame.png नहीं मिली, तो सिर्फ सादा QR कोड भेज देगा (क्रैश नहीं होगा)
+        final_img = qr_img
+
     bio = io.BytesIO()
-    qr_img.save(bio, "PNG")
+    final_img.save(bio, "PNG")
     bio.seek(0)
     return bio, clean_amt
 
@@ -814,7 +843,7 @@ def start_command(message):
 def handle_all_messages(message):
     user_id = message.chat.id
     if is_maintenance_mode() and user_id != ADMIN_ID:
-        orig_send_message(user_id, "⚠️️ <b>Bot is currently under maintenance.</b>\nServers are busy or undergoing updates. Please try again after some time.", parse_mode="HTML")
+        orig_send_message(user_id, "⚠ <b>Bot is currently under maintenance.</b>\nServers are busy or undergoing updates. Please try again after some time.", parse_mode="HTML")
         return
     if not check_rate_limit(user_id, 1): return
     register_activity(user_id, message.message_id, "general")
@@ -1025,7 +1054,7 @@ def handle_all_messages(message):
                     admin_data[ADMIN_ID]["buttons"].append({"text": t.strip(), "url": u.strip()})
                     m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish & Save", callback_data="succ_finish"))
                     bot.send_message(ADMIN_ID, f"✅ <b>Button Added! ({len(admin_data[ADMIN_ID]['buttons'])})</b>", reply_markup=m, parse_mode="HTML")
-                except Exception: bot.send_message(ADMIN_ID, "❌ Format error. <code>Name - Link</code>", parse_mode="HTML")
+                except Exception: bot.send_message(ADMIN_ID, "❌ Format error. <code>Button Text - URL</code>", parse_mode="HTML")
             return
         elif step == "INTL_SET_NAME":
             b_name = message.text.strip()
@@ -1483,7 +1512,7 @@ def handle_buttons(call):
                         return deliver_course_to_buyer(o_data, sms_text=sms_rec.get("raw_text"), is_manual=False)
 
                 qr_img_bio, clean_amt = generate_upi_qr(amt_key, order_id)
-                inv = f"👤 <b>User:</b> {call.from_user.first_name}\n🆔 <b>Order:</b> <code>{order_id}</code>\n💰 <b>Amount:</b> ₹{clean_amt}\n⚠️ <b>Please pay the exact amount shown.</b>\n⏳ <i>QR will expire in {QR_EXPIRY_SECONDS // 60} minutes.</i>"
+                inv = f"👤 <b>User:</b> {call.from_user.first_name}\n🆔 <b>Order:</b> <code>{order_id}</code>\n💰 <b>Amount:</b> ₹{clean_amt}\n⚠️ <b>Please pay the exact amount shown.</b>\n⏳ <i>QR will expire in {QR_EXPIRY_SECONDS // 60} minutes.</i>\n\n⚡ <b>Scan & Pay to get automatically added to the Channel/Group!</b>"
 
                 m = InlineKeyboardMarkup()
                 if CHAT_LINK: m.row(InlineKeyboardButton("💬 Chat with Me", url=CHAT_LINK))
