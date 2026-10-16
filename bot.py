@@ -261,66 +261,103 @@ bot.send_media_group = orig_send_media_group
 # # ==========================================
 # 📸 QR CODE & CUSTOM FRAME GENERATOR
 # ==========================================
+# frame.png (2048x2048) के अंदर के मापे गए पिक्सेल कोऑर्डिनेट्स.
+# अगर frame.png बदलो, तो ये नंबर फिर से मापने होंगे.
+FRAME_QR_BOX = (485, 552, 1562, 1631)      # सफ़ेद QR डिब्बा (left, top, right, bottom)
+QR_PADDING = 26                             # डिब्बे के हर तरफ़ हल्का सफ़ेद स्पेस
+FRAME_RUPEE_RIGHT = 1160                    # ₹ निशान का दाहिना किनारा
+FRAME_AMOUNT_BOX = (1061, 1742, 1445, 1872) # AMOUNT वाला सफ़ेद फ़ील्ड
+AMOUNT_MAX_FONT = 100
+AMOUNT_MIN_FONT = 40
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FRAME_PATH = os.path.join(BASE_DIR, "frame.png")
+FONT_PATHS = [
+    os.path.join(BASE_DIR, "Roboto-Bold.ttf"),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+]
+
+
+def _load_amount_font(size):
+    from PIL import ImageFont
+    for path in FONT_PATHS:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception as e:
+                print("Font load failed:", path, e)
+    # आखिरी fallback: Roboto डाउनलोड करने की कोशिश (सिर्फ़ तब जब कोई font फाइल न मिले)
+    try:
+        import urllib.request
+        target = os.path.join(BASE_DIR, "Roboto-Bold.ttf")
+        urllib.request.urlretrieve("https://github.com/google/fonts/raw/main/ofl/roboto/Roboto-Bold.ttf", target)
+        return ImageFont.truetype(target, size)
+    except Exception as e:
+        print("Font download failed:", e)
+    # Pillow >= 10.1 में load_default(size) असली साइज़ से फ़ॉन्ट देता है
+    return ImageFont.load_default(size=size)
+
+
 def generate_upi_qr(amount, order_id):
     from PIL import ImageFont, ImageDraw, Image
-    import os
-    import urllib.request
-    
+
     clean_amt = re.sub(r"[^\d.]", "", str(amount))
     upi_url = f"upi://pay?pa={UPI_ID}&pn={MERCHANT_NAME}&am={clean_amt}&cu=INR&tn=Order_{order_id}"
-    
-    # 1. बेसिक QR कोड बनाएं 
+
+    # 1. बेसिक QR कोड बनाएं
     qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=1)
     qr.add_data(upi_url)
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGBA")
-    
-    try:
-        # 2. आपकी डिज़ाइन (frame.png) लोड करें
-        background = Image.open("frame.png").convert("RGBA")
-        bg_w, bg_h = background.size
-        
-        # --- QR CODE का साइज़ ---
-        qr_size = int(bg_w * 0.42)
-        qr_img = qr_img.resize((qr_size, qr_size), Image.Resampling.LANCZOS)
-        
-        # --- QR कोड के किनारे गोल (Round) करना ---
-        mask = Image.new("L", (qr_size, qr_size), 0)
-        draw_mask = ImageDraw.Draw(mask)
-        radius = int(qr_size * 0.06) 
-        draw_mask.rounded_rectangle((0, 0, qr_size, qr_size), radius, fill=255)
-        qr_img.putalpha(mask)
-        
-        qr_x = (bg_w - qr_size) // 2
-        qr_y = int(bg_h * 0.29)
-        
-        background.paste(qr_img, (qr_x, qr_y), qr_img)
-        
-        # --- AMOUNT की परफेक्ट साइज़ और पोजीशन ---
-        draw = ImageDraw.Draw(background)
-        amt_text = f"{clean_amt}"
-        
-        font_path = "Roboto-Bold.ttf"
-        if not os.path.exists(font_path):
-            try:
-                urllib.request.urlretrieve("https://github.com/google/fonts/raw/main/ofl/roboto/Roboto-Bold.ttf", font_path)
-            except Exception as e:
-                print("Font load failed:", e)
-                
-        try:
-            # ₹ के लोगो के हिसाब से एकदम पर्फेक्ट और बड़ा साइज़ (0.05)
-            font = ImageFont.truetype(font_path, int(bg_h * 0.05)) 
-        except:
-            font = ImageFont.load_default()
 
-        # ₹ के निशान के ठीक आगे और डिब्बे के बीचो-बीच सेट करने के लिए कोऑर्डिनेट्स
-        text_x = int(bg_w * 0.58)  
-        text_y = int(bg_h * 0.825)  
-        
+    try:
+        # 2. आपकी डिज़ाइन (frame.png) लोड करें
+        background = Image.open(FRAME_PATH).convert("RGBA")
+
+        # --- QR: सफ़ेद डिब्बे के अंदर परफ़ेक्ट सेंटर में, हर तरफ़ बराबर पैडिंग ---
+        box_l, box_t, box_r, box_b = FRAME_QR_BOX
+        qr_size = min(box_r - box_l + 1, box_b - box_t + 1) - 2 * QR_PADDING
+        qr_img = qr_img.resize((qr_size, qr_size), Image.Resampling.LANCZOS)
+
+        # किनारे हल्के गोल
+        mask = Image.new("L", (qr_size, qr_size), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, qr_size, qr_size), int(qr_size * 0.06), fill=255)
+        qr_img.putalpha(mask)
+
+        qr_x = (box_l + box_r + 1) // 2 - qr_size // 2
+        qr_y = (box_t + box_b + 1) // 2 - qr_size // 2
+        background.paste(qr_img, (qr_x, qr_y), qr_img)
+
+        # --- AMOUNT: ₹ के ठीक आगे, सफ़ेद फ़ील्ड के बीच में (vertical center) ---
+        draw = ImageDraw.Draw(background)
+        amt_text = clean_amt
+        f_l, f_t, f_r, f_b = FRAME_AMOUNT_BOX
+        text_left = FRAME_RUPEE_RIGHT + 22
+        text_right_limit = f_r - 20
+        avail_w = text_right_limit - text_left
+        field_cy = (f_t + f_b) // 2
+
+        # फ़ॉन्ट साइज़ auto-fit: सबसे बड़ा साइज़ जो पूरा अमाउंट फ़ील्ड की चौड़ाई में आ जाए
+        font = None
+        for size in range(AMOUNT_MAX_FONT, AMOUNT_MIN_FONT - 1, -2):
+            candidate = _load_amount_font(size)
+            l, t, r, b = candidate.getbbox(amt_text)
+            if (r - l) <= avail_w:
+                font = candidate
+                break
+        if font is None:
+            font = _load_amount_font(AMOUNT_MIN_FONT)
+
+        # अक्षरों की असली ऊँचाई (cap height) के हिसाब से vertical center
+        l, t, r, b = font.getbbox(amt_text)
+        ct_l, ct_t, ct_r, ct_b = font.getbbox("0")
+        text_x = text_left - l
+        text_y = field_cy - (ct_t + ct_b) // 2
         draw.text((text_x, text_y), amt_text, font=font, fill="#1D3B70")
-        
+
         final_img = background
-        
+
     except Exception as ec:
         print(f"⚠️ Frame Error: {ec}")
         final_img = qr_img
@@ -330,6 +367,7 @@ def generate_upi_qr(amount, order_id):
     bio.seek(0)
     return bio, clean_amt
 # ==========================================
+
 # 🛡️ RATE LIMITER & STATE MANAGEMENT
 # ==========================================
 admin_data, user_states, user_qr_messages, pending_orders, all_orders_cache = {}, {}, {}, {}, {}
