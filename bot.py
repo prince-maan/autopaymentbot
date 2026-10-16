@@ -10,8 +10,10 @@ import time
 import uuid
 from datetime import datetime, timezone, timedelta
 
+# .env फाइल से टोकन लोड करने के लिए
 from dotenv import load_dotenv
 load_dotenv()
+
 from flask import Flask, request, jsonify, Response
 from functools import wraps
 from PIL import Image, ImageDraw, ImageFont
@@ -263,53 +265,55 @@ def generate_upi_qr(amount, order_id):
     clean_amt = re.sub(r"[^\d.]", "", str(amount))
     upi_url = f"upi://pay?pa={UPI_ID}&pn={MERCHANT_NAME}&am={clean_amt}&cu=INR&tn=Order_{order_id}"
     
-    # 1. बेसिक QR कोड बनाएं
-    qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=1)
+    # 1. बेसिक QR कोड बनाएं (बॉर्डर 0 कर दिया ताकि फालतू सफेद जगह न आए)
+    qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=0)
     qr.add_data(upi_url)
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGBA")
     
     try:
-        # 2. आपकी बनाई हुई डिज़ाइन (frame.png) लोड करें
+        # 2. आपकी डिज़ाइन (frame.png) लोड करें
         background = Image.open("frame.png").convert("RGBA")
         bg_w, bg_h = background.size
         
-        # 3. QR कोड को फ्रेम के हिसाब से छोटा/बड़ा करें (फ्रेम की चौड़ाई का 60%)
-        qr_size = int(bg_w * 0.60)
+        # --- QR CODE की सेटिंग ---
+        # 3. QR कोड को फ्रेम के नीले बॉक्स के हिसाब से छोटा/बड़ा करें (फ्रेम की चौड़ाई का 56%)
+        qr_size = int(bg_w * 0.56)
         qr_img = qr_img.resize((qr_size, qr_size), Image.Resampling.LANCZOS)
         
-        # 4. QR कोड को फ्रेम के बीच में सेट करने की जगह (X, Y)
-        # अगर QR थोड़ा ऊपर-नीचे हो, तो 0.22 वाले नंबर को कम या ज्यादा करके सेट कर लें
+        # 4. QR कोड को बिल्कुल सेंटर में सेट करें
         qr_x = (bg_w - qr_size) // 2
-        qr_y = int(bg_h * 0.22) 
+        qr_y = int(bg_h * 0.26)
         
         # फ्रेम पर QR पेस्ट कर दें
         background.paste(qr_img, (qr_x, qr_y))
         
-        # 5. अमाउंट लिखना
+        # --- AMOUNT (पैसे) की सेटिंग ---
         draw = ImageDraw.Draw(background)
         amt_text = f"{clean_amt}"
         
-        # फॉन्ट का साइज़ सेट करने की कोशिश (ताकि छोटा न दिखे)
+        # 5. फॉन्ट का साइज़ बहुत बड़ा कर दिया (फ्रेम की हाइट का 8%)
         try:
-            # अगर सर्वर पर कोई फॉन्ट फाइल नहीं है, तो डिफॉल्ट फॉन्ट लेगा
-            font = ImageFont.truetype("arial.ttf", int(bg_h * 0.05)) 
+            # अगर सर्वर पर arial.ttf है तो यह लेगा
+            font = ImageFont.truetype("arial.ttf", int(bg_h * 0.08)) 
         except:
+            # अगर arial नहीं है, तो डिफॉल्ट फॉन्ट को बड़ा करेगा
             font = ImageFont.load_default()
-            
-        # टेक्स्ट की जगह (X, Y) - अगर अमाउंट थोड़ा दाएं-बाएं हो, तो इसे बदल लें
-        text_x = int(bg_w * 0.58)  
-        text_y = int(bg_h * 0.86)  
+            if hasattr(font, 'getbbox'):
+                font = font.font_variant(size=int(bg_h * 0.08))
+
+        # 6. टेक्स्ट की जगह (X, Y) - अमाउंट को नीले बॉक्स के अंदर सेट किया
+        text_x = int(bg_w * 0.53)  
+        text_y = int(bg_h * 0.835)  
         
-        # अमाउंट को नीले या काले रंग में लिख दें
+        # 7. अमाउंट को गाढ़े नीले (#1D3B70) में लिख दें
         draw.text((text_x, text_y), amt_text, fill="#1D3B70", font=font)
         
-        # फाइनल इमेज को सेव करने के लिए तैयार करें
         final_img = background
         
     except Exception as e:
         print(f"⚠️ Frame Error: {e}")
-        # अगर frame.png नहीं मिली, तो सिर्फ सादा QR कोड भेज देगा (क्रैश नहीं होगा)
+        # अगर frame.png नहीं मिली, तो सादा QR कोड भेज देगा
         final_img = qr_img
 
     bio = io.BytesIO()
