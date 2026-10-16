@@ -10,6 +10,8 @@ import time
 import uuid
 from datetime import datetime, timezone, timedelta
 
+from dotenv import load_dotenv
+load_dotenv()
 from flask import Flask, request, jsonify, Response
 from functools import wraps
 from PIL import Image, ImageDraw, ImageFont
