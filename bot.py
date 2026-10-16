@@ -262,10 +262,12 @@ bot.send_media_group = orig_send_media_group
 # 📸 QR CODE & CUSTOM FRAME GENERATOR
 # ==========================================
 def generate_upi_qr(amount, order_id):
+    from PIL import ImageFont
+    
     clean_amt = re.sub(r"[^\d.]", "", str(amount))
     upi_url = f"upi://pay?pa={UPI_ID}&pn={MERCHANT_NAME}&am={clean_amt}&cu=INR&tn=Order_{order_id}"
     
-    # 1. बेसिक QR कोड बनाएं (बॉर्डर 0 कर दिया ताकि फालतू सफेद जगह न आए)
+    # 1. बेसिक QR कोड बनाएं 
     qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=0)
     qr.add_data(upi_url)
     qr.make(fit=True)
@@ -276,51 +278,50 @@ def generate_upi_qr(amount, order_id):
         background = Image.open("frame.png").convert("RGBA")
         bg_w, bg_h = background.size
         
-        # --- QR CODE की सेटिंग ---
-        # 3. QR कोड को फ्रेम के नीले बॉक्स के हिसाब से छोटा/बड़ा करें (फ्रेम की चौड़ाई का 56%)
-        qr_size = int(bg_w * 0.56)
+        # --- QR CODE को छोटा किया ---
+        # 56% से घटाकर 48% कर दिया ताकि नीले बॉक्स में बिल्कुल फिट आए
+        qr_size = int(bg_w * 0.48)
         qr_img = qr_img.resize((qr_size, qr_size), Image.Resampling.LANCZOS)
         
-        # 4. QR कोड को बिल्कुल सेंटर में सेट करें
+        # QR को सेंटर में सेट किया
         qr_x = (bg_w - qr_size) // 2
-        qr_y = int(bg_h * 0.26)
+        qr_y = int(bg_h * 0.265) 
         
         # फ्रेम पर QR पेस्ट कर दें
         background.paste(qr_img, (qr_x, qr_y))
         
-        # --- AMOUNT (पैसे) की सेटिंग ---
+        # --- AMOUNT की सेटिंग (बड़ा फॉन्ट) ---
         draw = ImageDraw.Draw(background)
         amt_text = f"{clean_amt}"
         
-        # 5. फॉन्ट का साइज़ बहुत बड़ा कर दिया (फ्रेम की हाइट का 8%)
+        # Linux (AWS Ubuntu) के ओरिजिनल फॉन्ट का पाथ दिया है, ताकि पक्का बड़ा दिखे
+        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
         try:
-            # अगर सर्वर पर arial.ttf है तो यह लेगा
-            font = ImageFont.truetype("arial.ttf", int(bg_h * 0.08)) 
+            # अमाउंट का साइज़
+            font = ImageFont.truetype(font_path, int(bg_h * 0.055)) 
         except:
-            # अगर arial नहीं है, तो डिफॉल्ट फॉन्ट को बड़ा करेगा
-            font = ImageFont.load_default()
-            if hasattr(font, 'getbbox'):
-                font = font.font_variant(size=int(bg_h * 0.08))
+            try:
+                font = ImageFont.truetype("arial.ttf", int(bg_h * 0.055))
+            except:
+                font = ImageFont.load_default()
 
-        # 6. टेक्स्ट की जगह (X, Y) - अमाउंट को नीले बॉक्स के अंदर सेट किया
-        text_x = int(bg_w * 0.53)  
-        text_y = int(bg_h * 0.835)  
+        # टेक्स्ट की लोकेशन सेट की
+        text_x = int(bg_w * 0.55)  
+        text_y = int(bg_h * 0.85)  
         
-        # 7. अमाउंट को गाढ़े नीले (#1D3B70) में लिख दें
+        # अमाउंट को गाढ़े नीले (#1D3B70) रंग में लिख दें
         draw.text((text_x, text_y), amt_text, fill="#1D3B70", font=font)
         
         final_img = background
         
     except Exception as e:
         print(f"⚠️ Frame Error: {e}")
-        # अगर frame.png नहीं मिली, तो सादा QR कोड भेज देगा
         final_img = qr_img
 
     bio = io.BytesIO()
     final_img.save(bio, "PNG")
     bio.seek(0)
     return bio, clean_amt
-
 # ==========================================
 # 🛡️ RATE LIMITER & STATE MANAGEMENT
 # ==========================================
