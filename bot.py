@@ -258,8 +258,7 @@ def tracked_send_document(chat_id, *args, **kwargs):
 bot.send_document = tracked_send_document
 bot.send_media_group = orig_send_media_group
 
-# ==========================================
-# ==========================================
+# # ==========================================
 # 📸 QR CODE & CUSTOM FRAME GENERATOR
 # ==========================================
 def generate_upi_qr(amount, order_id):
@@ -270,7 +269,7 @@ def generate_upi_qr(amount, order_id):
     clean_amt = re.sub(r"[^\d.]", "", str(amount))
     upi_url = f"upi://pay?pa={UPI_ID}&pn={MERCHANT_NAME}&am={clean_amt}&cu=INR&tn=Order_{order_id}"
     
-    # 1. बेसिक QR कोड बनाएं (border=1 रखा है ताकि कोनों को गोल करते वक्त QR का डेटा न कटे)
+    # 1. बेसिक QR कोड बनाएं 
     qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=1)
     qr.add_data(upi_url)
     qr.make(fit=True)
@@ -281,32 +280,26 @@ def generate_upi_qr(amount, order_id):
         background = Image.open("frame.png").convert("RGBA")
         bg_w, bg_h = background.size
         
-        # --- QR CODE को छोटा किया (Padding के लिए 47%) ---
-        qr_size = int(bg_w * 0.47)
+        # --- QR CODE का साइज़ ---
+        qr_size = int(bg_w * 0.42)
         qr_img = qr_img.resize((qr_size, qr_size), Image.Resampling.LANCZOS)
         
-        # --- QR CODE के किनारों (Edges) को गोल (Round) करना ---
+        # --- QR कोड के किनारे गोल (Round) करना ---
         mask = Image.new("L", (qr_size, qr_size), 0)
         draw_mask = ImageDraw.Draw(mask)
-        # किनारों को 6% गोल किया (आप चाहें तो 0.06 को बदल भी सकते हैं)
         radius = int(qr_size * 0.06) 
         draw_mask.rounded_rectangle((0, 0, qr_size, qr_size), radius, fill=255)
-        
-        # QR कोड पर गोल कटिंग (Mask) अप्लाई करें
         qr_img.putalpha(mask)
         
-        # QR को सेंटर में सेट करना (थोड़ा नीचे ताकि बॉक्स के बीच में रहे)
         qr_x = (bg_w - qr_size) // 2
-        qr_y = int(bg_h * 0.285) 
+        qr_y = int(bg_h * 0.29)
         
-        # फ्रेम पर गोल QR पेस्ट कर दें (Mask के साथ)
         background.paste(qr_img, (qr_x, qr_y), qr_img)
         
-        # --- AMOUNT (पैसे) की सेटिंग ---
+        # --- AMOUNT की परफेक्ट साइज़ और पोजीशन ---
         draw = ImageDraw.Draw(background)
         amt_text = f"{clean_amt}"
         
-        # 3. ऑटोमैटिक फॉन्ट डाउनलोडर
         font_path = "Roboto-Bold.ttf"
         if not os.path.exists(font_path):
             try:
@@ -315,22 +308,21 @@ def generate_upi_qr(amount, order_id):
                 print("Font load failed:", e)
                 
         try:
-            # फॉन्ट को लोड करें 
-            font = ImageFont.truetype(font_path, int(bg_h * 0.045)) 
+            # ₹ के लोगो के हिसाब से एकदम पर्फेक्ट और बड़ा साइज़ (0.05)
+            font = ImageFont.truetype(font_path, int(bg_h * 0.05)) 
         except:
             font = ImageFont.load_default()
 
-        # 4. टेक्स्ट की जगह (X, Y) - अमाउंट को डिब्बे के अंदर सेट किया
+        # ₹ के निशान के ठीक आगे और डिब्बे के बीचो-बीच सेट करने के लिए कोऑर्डिनेट्स
         text_x = int(bg_w * 0.58)  
-        text_y = int(bg_h * 0.83)  
+        text_y = int(bg_h * 0.825)  
         
-        # अमाउंट को गाढ़े नीले (#1D3B70) रंग में प्रिंट करें
-        draw.text((text_x, text_y), amt_text, fill="#1D3B70", font=font)
+        draw.text((text_x, text_y), amt_text, font=font, fill="#1D3B70")
         
         final_img = background
         
-    except Exception as e:
-        print(f"⚠️ Frame Error: {e}")
+    except Exception as ec:
+        print(f"⚠️ Frame Error: {ec}")
         final_img = qr_img
 
     bio = io.BytesIO()
