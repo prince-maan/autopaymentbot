@@ -1,5 +1,6 @@
 import gc
 import hmac
+import secrets
 import io
 import json
 import os
@@ -15,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 load_dotenv()
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, session
 from functools import wraps
 from PIL import Image, ImageDraw, ImageFont
 import pymongo
@@ -32,43 +33,125 @@ from telebot.types import (
 )
 
 # ==========================================
-# 🛑 ENVIRONMENT VARIABLES
+# 🛑 BOOT SETTINGS (पहली बार सिर्फ़ Dashboard से भरें)
 # ==========================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MONGO_URI = os.environ.get("MONGO_URI")
-MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "telegram_store_bot")
+# MongoDB link और Dashboard login एक छोटी फाइल में रहते हैं (आपके home folder में)।
+# इन्हें Dashboard के "Add Bot / Setup" में भरा जाता है। पुराने environment variables भी चलते हैं।
+BOOT_FILE = os.path.join(os.path.expanduser("~"), ".telegram_store_bot_boot.json")
+BOOT_DEFAULT_DB = "telegram_store_bot"
 
-UPI_ID = os.environ.get("UPI_ID")
-MERCHANT_NAME = os.environ.get("MERCHANT_NAME", "Store")
-SMS_HOOK_SECRET = os.environ.get("SMS_HOOK_SECRET")
+def load_boot():
+    data = {}
+    try:
+        with open(BOOT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except Exception:
+        data = {}
 
-CHAT_LINK = os.environ.get("CHAT_LINK")
-INTERNATIONAL_LINK = os.environ.get("INTERNATIONAL_LINK")
+    def pick(key, default=""):
+        # पहले boot file, फिर पुराना environment variable
+        return str(data.get(key) or os.environ.get(key) or default).strip()
 
-PROTECT_CONTENT = os.environ.get("PROTECT_CONTENT", "False").strip().lower() == "true"
-QR_EXPIRY_SECONDS = int(os.environ.get("QR_EXPIRY_MINUTES", "10")) * 60
-STALE_ORDER_SECONDS = int(os.environ.get("STALE_ORDER_HOURS", "24")) * 3600
-SMS_POOL_TTL_HOURS = int(os.environ.get("SMS_POOL_TTL_HOURS", "5"))
-ORDER_TTL_HOURS = int(os.environ.get("ORDER_TTL_HOURS", "48"))
+    return {
+        "MONGO_URI": pick("MONGO_URI"),
+        "MONGO_DB_NAME": pick("MONGO_DB_NAME", BOOT_DEFAULT_DB) or BOOT_DEFAULT_DB,
+        "DASHBOARD_USERNAME": pick("DASHBOARD_USERNAME", "admin") or "admin",
+        "DASHBOARD_PASSWORD": pick("DASHBOARD_PASSWORD"),
+    }
 
-DASHBOARD_USERNAME = os.environ.get("DASHBOARD_USERNAME", "admin")
-DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
-if not DASHBOARD_PASSWORD or DASHBOARD_PASSWORD == "changeme123":
-    print("❌ ERROR: DASHBOARD_PASSWORD सेट करें (default/कमज़ोर पासवर्ड allowed नहीं है)।")
-    sys.exit(1)
+def save_boot(values):
+    data = {}
+    try:
+        with open(BOOT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except Exception:
+        data = {}
+    data.update(values)
+    with open(BOOT_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(BOOT_FILE, 0o600)
+    except Exception:
+        pass
 
-try:
-    ADMIN_ID = int(os.environ.get("ADMIN_ID"))
-    DB_CHANNEL_ID = int(os.environ.get("DB_CHANNEL_ID"))
-except (TypeError, ValueError):
-    print("❌ ERROR: 'ADMIN_ID' or 'DB_CHANNEL_ID' Environment Variable is not set properly.")
-    sys.exit(1)
+BOOT = load_boot()
+MONGO_URI = BOOT["MONGO_URI"]
+MONGO_DB_NAME = BOOT["MONGO_DB_NAME"]
+DASHBOARD_USERNAME = BOOT["DASHBOARD_USERNAME"]
+DASHBOARD_PASSWORD = BOOT["DASHBOARD_PASSWORD"]
+if DASHBOARD_PASSWORD == "changeme123":
+    DASHBOARD_PASSWORD = ""
 
-if not BOT_TOKEN or not MONGO_URI or not UPI_ID or not SMS_HOOK_SECRET:
-    print("❌ ERROR: Required Environment Variables are missing.")
-    sys.exit(1)
+# पहली setup के लिए 6-digit code (terminal में दिखता है), ताकि कोई अनजान व्यक्ति settings न बदल सके
+SETUP_CODE = "".join(secrets.choice("0123456789") for _ in range(6))
 
-bot = telebot.TeleBot(BOT_TOKEN, num_threads=20)
+# Dashboard से भरी जाने वाली bot settings (key -> default)
+BOT_CONFIG_KEYS = {
+    "BOT_TOKEN": "",
+    "ADMIN_ID": "",
+    "DB_CHANNEL_ID": "",
+    "UPI_ID": "",
+    "MERCHANT_NAME": "Store",
+    "SMS_HOOK_SECRET": "",
+    "CHAT_LINK": "",
+    "INTERNATIONAL_LINK": "",
+    "QR_EXPIRY_MINUTES": "10",
+    "STALE_ORDER_HOURS": "24",
+    "SMS_POOL_TTL_HOURS": "5",
+    "ORDER_TTL_HOURS": "48",
+}
+
+_boot_client = None
+_boot_db = None
+if MONGO_URI:
+    try:
+        _boot_client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
+        _boot_db = _boot_client.get_database(MONGO_DB_NAME)
+    except Exception as e:
+        print(f"⚠️ MongoDB URL समझ नहीं आया: {e}")
+
+def load_bot_config(db=None):
+    """MongoDB की "bot_config" से settings पढ़ता है। Environment variables भी fallback हैं।"""
+    cfg = {}
+    for k, default in BOT_CONFIG_KEYS.items():
+        cfg[k] = os.environ.get(k, default)
+    try:
+        target = db if db is not None else _boot_db
+        if target is not None:
+            doc = target["settings"].find_one({"_id": "bot_config"}) or {}
+            for k in BOT_CONFIG_KEYS:
+                if doc.get(k) is not None:
+                    cfg[k] = str(doc[k])
+    except Exception as e:
+        print(f"⚠️ Config load error: {e}")
+    return cfg
+
+def _to_int(v):
+    try: return int(str(v).strip())
+    except (TypeError, ValueError): return None
+
+def _to_num(v, default):
+    try: return float(str(v).strip())
+    except (TypeError, ValueError): return default
+
+CFG = load_bot_config()
+BOT_TOKEN = CFG["BOT_TOKEN"].strip()
+ADMIN_ID = _to_int(CFG["ADMIN_ID"])
+DB_CHANNEL_ID = _to_int(CFG["DB_CHANNEL_ID"])
+UPI_ID = CFG["UPI_ID"].strip()
+MERCHANT_NAME = CFG["MERCHANT_NAME"].strip() or "Store"
+SMS_HOOK_SECRET = CFG["SMS_HOOK_SECRET"].strip()
+CHAT_LINK = CFG["CHAT_LINK"].strip()
+INTERNATIONAL_LINK = CFG["INTERNATIONAL_LINK"].strip()
+QR_EXPIRY_SECONDS = int(_to_num(CFG["QR_EXPIRY_MINUTES"], 10) * 60)
+STALE_ORDER_SECONDS = int(_to_num(CFG["STALE_ORDER_HOURS"], 24) * 3600)
+SMS_POOL_TTL_HOURS = int(_to_num(CFG["SMS_POOL_TTL_HOURS"], 5))
+ORDER_TTL_HOURS = int(_to_num(CFG["ORDER_TTL_HOURS"], 48))
+
+# Bot तभी चलेगा जब ज़रूरी settings भरी हों। वरना सिर्फ़ Dashboard खुलेगा (Setup mode)।
+BOT_CONFIGURED = bool(MONGO_URI and DASHBOARD_PASSWORD and BOT_TOKEN and ADMIN_ID and DB_CHANNEL_ID and UPI_ID and SMS_HOOK_SECRET)
+
+bot = telebot.TeleBot(BOT_TOKEN or "1:SETUP", num_threads=20)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def get_ist_time():
@@ -110,8 +193,12 @@ def is_admin(uid):
 # ==========================================
 # 🍃 MONGODB SETUP
 # ==========================================
+DB_READY = False
 try:
-    mongo_client = pymongo.MongoClient(MONGO_URI)
+    if not MONGO_URI:
+        raise RuntimeError("MongoDB URL अभी सेट नहीं है")
+    mongo_client = _boot_client
+    mongo_client.admin.command("ping")
     db = mongo_client.get_database(MONGO_DB_NAME)
     users_col = db["users"]
     courses_col = db["courses"]
@@ -138,12 +225,17 @@ try:
         broadcasts_col.create_index("bid")
     except Exception:
         pass
+    DB_READY = True
     print(f"✅ MongoDB Connected! (Database: {MONGO_DB_NAME})")
 except Exception as e:
     print(f"❌ MongoDB Error: {e}")
-    sys.exit(1)
+    print("⚠️ Dashboard खुलेगा ताकि आप 'Add Bot / Setup' में MongoDB URL ठीक कर सकें।")
 
 # ==========================================
+BOT_CONFIGURED = BOT_CONFIGURED and DB_READY
+if not BOT_CONFIGURED:
+    print("⚠️ Setup mode: Dashboard खोलें और 'Add Bot / Setup' में settings भरें।")
+
 # 🚀 SMART CACHE SYSTEM
 # ==========================================
 db_cache = {}
@@ -194,6 +286,11 @@ def invalidate_cache(key):
 # ==========================================
 # ⚙️ MAINTENANCE & AUTO-CLEAR SETTINGS
 # ==========================================
+def is_protected():
+    """Content protection (forward/save बंद) — Dashboard की Settings से ON/OFF होता है, restart नहीं चाहिए"""
+    cfg = get_cached_setting("system_settings") or {}
+    return bool(cfg.get("protect_content", False))
+
 def is_maintenance_mode():
     cfg = get_cached_setting("system_settings")
     return cfg.get("maintenance", False) if cfg else False
@@ -627,7 +724,7 @@ def deliver_course_to_buyer(order, sms_text=None, is_manual=False):
     
     if not markup.keyboard: markup = None
 
-    try: bot.send_message(chat_id, final_text, reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="purchase")
+    try: bot.send_message(chat_id, final_text, reply_markup=markup, parse_mode="HTML", protect_content=is_protected(), msg_type="purchase")
     except Exception: pass
 
     date_now = get_ist_time()
@@ -752,13 +849,13 @@ def send_course_to_user(chat_id, course):
     if not media_items:
         full_text = "".join(t.get("caption", "") + "\n\n" for t in text_items) + custom_caption
         if not full_text.strip(): full_text = f"📚 <b>Pack: {course.get('title', course['course_id'])}</b>\nPrice: ₹{int(final_price) if final_price.is_integer() else final_price}"
-        msg = bot.send_message(chat_id, full_text.strip(), reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
+        msg = bot.send_message(chat_id, full_text.strip(), reply_markup=markup, parse_mode="HTML", protect_content=is_protected(), msg_type="course")
         sent_mids.append(msg.message_id)
     elif len(media_items) == 1:
         it = media_items[0]
         try:
-            if it["type"] == "photo": msg = bot.send_photo(chat_id, it["file_id"], caption=final_cap, reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
-            elif it["type"] == "video": msg = bot.send_video(chat_id, it["file_id"], caption=final_cap, reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
+            if it["type"] == "photo": msg = bot.send_photo(chat_id, it["file_id"], caption=final_cap, reply_markup=markup, parse_mode="HTML", protect_content=is_protected(), msg_type="course")
+            elif it["type"] == "video": msg = bot.send_video(chat_id, it["file_id"], caption=final_cap, reply_markup=markup, parse_mode="HTML", protect_content=is_protected(), msg_type="course")
             if msg: sent_mids.append(msg.message_id)
         except Exception: pass
     else:
@@ -768,7 +865,7 @@ def send_course_to_user(chat_id, course):
             if item["type"] == "photo": media_group_html.append(InputMediaPhoto(item["file_id"], caption=cap, parse_mode="HTML"))
             elif item["type"] == "video": media_group_html.append(InputMediaVideo(item["file_id"], caption=cap, parse_mode="HTML"))
         try:
-            sent_grp = orig_send_media_group(chat_id, media_group_html, protect_content=PROTECT_CONTENT)
+            sent_grp = orig_send_media_group(chat_id, media_group_html, protect_content=is_protected())
             for m in sent_grp: 
                 register_activity(chat_id, m.message_id, "course")
                 sent_mids.append(m.message_id)
@@ -961,10 +1058,10 @@ def start_command(message):
                     it = m_items[0]
                     try:
                         msg = None
-                        if it["type"] == "text": msg = bot.send_message(user_id, it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
-                        elif it["type"] == "photo": msg = bot.send_photo(user_id, it["file_id"], caption=it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
-                        elif it["type"] == "video": msg = bot.send_video(user_id, it["file_id"], caption=it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
-                        elif it["type"] == "document": msg = bot.send_document(user_id, it["file_id"], caption=it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
+                        if it["type"] == "text": msg = bot.send_message(user_id, it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=is_protected(), msg_type="course")
+                        elif it["type"] == "photo": msg = bot.send_photo(user_id, it["file_id"], caption=it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=is_protected(), msg_type="course")
+                        elif it["type"] == "video": msg = bot.send_video(user_id, it["file_id"], caption=it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=is_protected(), msg_type="course")
+                        elif it["type"] == "document": msg = bot.send_document(user_id, it["file_id"], caption=it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=is_protected(), msg_type="course")
                         if msg: sent_mids.append(msg.message_id)
                     except Exception as e: bot.send_message(user_id, f"❌ Error: {e}", msg_type="general")
                 elif len(m_items) > 1:
@@ -974,7 +1071,7 @@ def start_command(message):
                         elif it["type"] == "video": m_group.append(InputMediaVideo(it["file_id"], caption=it["caption"], parse_mode="HTML"))
                         elif it["type"] == "document": m_group.append(InputMediaDocument(it["file_id"], caption=it["caption"], parse_mode="HTML"))
                     try:
-                        sent = orig_send_media_group(user_id, m_group, protect_content=PROTECT_CONTENT)
+                        sent = orig_send_media_group(user_id, m_group, protect_content=is_protected())
                         for m in sent: 
                             register_activity(user_id, m.message_id, "course")
                             sent_mids.append(m.message_id)
@@ -2018,6 +2115,28 @@ def handle_buttons(call):
 # FLASK WEB SERVER & API
 # ==========================================
 app = Flask(__name__)
+
+def _session_secret():
+    """Login cookie का secret। पहली बार बनता है और boot file में सेव रहता है।"""
+    data = {}
+    try:
+        with open(BOOT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except Exception:
+        data = {}
+    if not data.get("SESSION_SECRET"):
+        data["SESSION_SECRET"] = secrets.token_urlsafe(32)
+        try:
+            with open(BOOT_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.chmod(BOOT_FILE, 0o600)
+        except Exception:
+            pass
+    return data["SESSION_SECRET"]
+
+app.secret_key = _session_secret()
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+                  PERMANENT_SESSION_LIFETIME=timedelta(days=7))
 AMOUNT_RE_DECIMAL = re.compile(r"(?:Rs\.?|₹|INR)\s*([\d,]+\.\d{1,2})", re.IGNORECASE)
 AMOUNT_RE_INT = re.compile(r"(?:Rs\.?|₹|INR)\s*([\d,]+)(?!\.\d)", re.IGNORECASE)
 BOT_USERNAME = "your_bot" 
@@ -2061,13 +2180,26 @@ def sms_webhook(secret):
         return "ambiguous", 200
     return "saved_to_pool", 200
 
+def _is_logged_in():
+    return bool(DASHBOARD_PASSWORD and session.get("dash_ok"))
+
+_login_fail = {}  # IP -> गलत कोशिशों का समय (memory में, 15 मिनट की सीमा)
+
+def _login_blocked(ip):
+    now = time.time()
+    arr = [t for t in _login_fail.get(ip, []) if now - t < 900]
+    _login_fail[ip] = arr
+    return len(arr) >= 5
+
 def require_auth(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
-        auth = request.authorization
-        if not auth or not (hmac.compare_digest(auth.username or "", DASHBOARD_USERNAME) and hmac.compare_digest(auth.password or "", DASHBOARD_PASSWORD)):
-            return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Dashboard"'})
-        return f(*args, **kwargs)
+        if _is_logged_in():
+            return f(*args, **kwargs)
+        # पहली setup (dashboard password अभी नहीं बना): सिर्फ़ config खुला रहता है, उसमें setup code लगता है
+        if not DASHBOARD_PASSWORD and request.path == "/dashboard/api/config":
+            return f(*args, **kwargs)
+        return jsonify({"error": "Login required", "login_required": True}), 401
     return wrapper
 
 def _strip_html(s): return re.sub(r"<[^>]*>", "", s or "").strip()
@@ -2239,6 +2371,7 @@ def api_system_settings():
             "auto_del_promos": data.get("auto_del_promos", True),
             "auto_del_broadcasts": data.get("auto_del_broadcasts", True),
             "auto_del_purchases": data.get("auto_del_purchases", False),
+            "protect_content": bool(data.get("protect_content", False)),
             "course_timer_minutes": int(data.get("course_timer_minutes", 0)),
             "updated_at": get_ist_time()
         }
@@ -2266,6 +2399,7 @@ def api_system_settings():
         "auto_del_promos": cfg.get("auto_del_promos", True),
         "auto_del_broadcasts": cfg.get("auto_del_broadcasts", True),
         "auto_del_purchases": cfg.get("auto_del_purchases", False),
+        "protect_content": cfg.get("protect_content", False),
         "course_timer_minutes": int(cfg.get("course_timer_minutes", 0))
     })
 
@@ -2306,11 +2440,17 @@ def api_user_lookup():
     by_uid = {}
     for p, row in zip(purchases, rows):
         by_uid.setdefault(p.get("user_id"), []).append(row)
-    return jsonify([{
-        "user_id": u["user_id"],
-        "username": u["username"],
-        "purchases": by_uid.get(u["user_id"], []),
-    } for u in users])
+    out = []
+    for u in users:
+        prs = by_uid.get(u["user_id"], [])
+        out.append({
+            "user_id": u["user_id"],
+            "username": u["username"],
+            "purchases": prs,
+            "total": round(sum(r.get("rate") or 0 for r in prs), 2),
+            "channels": sorted({r["channel_name"] for r in prs if r.get("channel_name")}),
+        })
+    return jsonify(out)
 
 @app.route("/dashboard/api/purchases", methods=["DELETE"])
 @require_auth
@@ -2433,6 +2573,11 @@ def _cid_of(p):
     """खरीदी के रिकॉर्ड से course ID निकालता है (item_info = 'c_xxx | Rate: ...')"""
     return (p.get("item_info") or "").split(" |")[0].strip()
 
+def _rate_of(p):
+    """खरीदी के रिकॉर्ड से rate निकालता है (item_info में 'Rate: ₹xxx' लिखा होता है)"""
+    m = re.search(r"Rate: ₹\s*([\d.]+)", p.get("item_info") or "")
+    return float(m.group(1)) if m else None
+
 def _purchase_rows(purchases):
     """खरीदी के रिकॉर्ड को dashboard के लिए आसान format में बदलता है (कोर्स + चैनल का नाम)"""
     cids = list({_cid_of(p) for p in purchases if _cid_of(p)})
@@ -2450,6 +2595,7 @@ def _purchase_rows(purchases):
             "channel_name": c.get("channel_name") or "",
             "date": p.get("date", ""),
             "link": p.get("link", ""),
+            "rate": _rate_of(p),
         })
     return rows
 
@@ -2647,11 +2793,18 @@ main{padding:84px 18px 56px;max-width:1040px;margin:0 auto}
   .row .right{align-items:flex-start}
   .row .end{justify-content:flex-start}
 }
+.label-s{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.total-row{display:flex;justify-content:space-between;align-items:center;margin-top:16px;padding-top:14px;border-top:1px solid var(--line);font-size:15px}
+.total-row strong{font-size:18px}
 </style>
 </head>
 <body>
 
 <header class="topbar">
+  <button class="icon-btn" id="btn-back" title="Back" aria-label="Go back">
+    <svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>
+  </button>
   <button class="icon-btn" id="btn-menu" title="Menu" aria-label="Open menu">
     <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
   </button>
@@ -2665,9 +2818,11 @@ main{padding:84px 18px 56px;max-width:1040px;margin:0 auto}
 </header>
 
 <div class="menu" id="profile-menu">
+  <button data-act="open-setup">Add Bot / Setup</button>
   <button data-act="open-admins">Admins</button>
   <button data-act="refresh">Refresh</button>
   <hr>
+  <button data-act="logout">Log out</button>
   <button data-act="close-menu">Close</button>
 </div>
 
@@ -2724,6 +2879,7 @@ async function api(path, opts = {}){
   const o = Object.assign({headers: {"Content-Type": "application/json"}}, opts);
   if(o.body && typeof o.body !== "string") o.body = JSON.stringify(o.body);
   const r = await fetch(path, o);
+  if(r.status === 401){ location.reload(); return new Promise(() => {}); }  // session ended, show login
   let d = {};
   try { d = await r.json(); } catch(e) {}
   if(!r.ok) throw new Error(d.error || ("Request failed (" + r.status + ")"));
@@ -2754,14 +2910,14 @@ const NAV = [
   ["Sales", [["orders", "Orders", "check"], ["users", "Users & purchases", "users"]]],
   ["Store", [["courses", "Courses", "check"], ["offers", "Offers", "check"], ["logs", "Channel logs", "check"]]],
   ["Messaging", [["broadcast", "Broadcast", "check"], ["sms", "SMS pool & trigger", "check"]]],
-  ["System", [["settings", "Bot settings", "check"]]],
+  ["System", [["setup", "Bot setup", "check"], ["settings", "Bot settings", "check"]]],
 ];
 const TITLES = {home: "Dashboard", orders: "Orders", users: "Users & purchases", courses: "Courses", offers: "Offers",
-  logs: "Channel logs", broadcast: "Broadcast", sms: "SMS pool & trigger", settings: "Bot settings", search: "Search"};
+  logs: "Channel logs", broadcast: "Broadcast", sms: "SMS pool & trigger", settings: "Bot settings", setup: "Bot setup", search: "Search"};
 const SUBS = {home: "Overview of today's store activity.", orders: "Approve or cancel payment requests.",
   users: "Every user and the courses they bought.", courses: "Browse, inspect and remove packs.",
   offers: "Discount links for customers.", logs: "Channel join requests.", broadcast: "Message all users, and remove sent messages.",
-  sms: "Bank SMS pool and manual payment trigger.", settings: "Maintenance and auto-clean options."};
+  sms: "Bank SMS pool and manual payment trigger.", settings: "Maintenance and auto-clean options.", setup: "MongoDB link, bot token, IDs and payment details. Saving restarts the bot."};
 
 function buildNav(){
   $("#nav").innerHTML = NAV.map(([g, items]) =>
@@ -2799,6 +2955,7 @@ const SHELL = {
     <div class="form-grid"><div class="field"><label>Amount</label><input id="inj-amt" placeholder="50.01" inputmode="decimal"></div>
     <div><button class="btn primary" data-act="inject">Trigger</button></div></div></div><div id="list"></div>`,
   settings: () => `<div id="list"></div>`,
+  setup: () => `<div id="list"></div>`,
 };
 
 /* ============ data ============ */
@@ -2816,6 +2973,7 @@ const FETCH = {
   broadcast: () => api("/dashboard/api/broadcasts"),
   sms: () => api("/dashboard/api/sms-pool"),
   settings: () => api("/dashboard/api/system-settings"),
+  setup: () => api("/dashboard/api/config"),
 };
 
 function setListLoading(){
@@ -2937,6 +3095,61 @@ const RENDER = {
       <div class="right"><div class="meta">${esc(x.created_at)}</div></div></div>`).join("") : empty("No unused SMS in the pool.");
   },
 
+  setup: c => {
+    const FIELDS = [
+      ["BOT_TOKEN", "Bot token *", "From BotFather. Shown masked. Leave it as it is to keep the current token.", "text", "mono"],
+      ["ADMIN_ID", "Owner Telegram ID *", "Your numeric Telegram ID. You are always an admin.", "text", ""],
+      ["DB_CHANNEL_ID", "Private channel / log group ID *", "Usually starts with -100. Add the bot there as admin first.", "text", ""],
+      ["UPI_ID", "UPI ID *", "For example name@bank", "text", ""],
+      ["MERCHANT_NAME", "Merchant name", "Shown on the UPI payment screen", "text", ""],
+      ["SMS_HOOK_SECRET", "SMS webhook secret", "Leave empty to generate one automatically", "text", "mono"],
+      ["CHAT_LINK", "Contact link", "Optional. For example https://t.me/yourname", "text", ""],
+      ["INTERNATIONAL_LINK", "International payment link", "Optional", "text", ""],
+      ["QR_EXPIRY_MINUTES", "QR expiry (minutes)", "Default 10", "text", ""],
+      ["STALE_ORDER_HOURS", "Stale order window (hours)", "Default 24", "text", ""],
+      ["SMS_POOL_TTL_HOURS", "SMS pool keep time (hours)", "Default 5", "text", ""],
+      ["ORDER_TTL_HOURS", "Order keep time (hours)", "Default 48", "text", ""],
+    ];
+    const BOOT = [
+      ["MONGO_URI", "MongoDB URL *", "Your MongoDB connection link. Shown masked. Leave it as it is to keep the current one.", "text", "mono"],
+      ["MONGO_DB_NAME", "Database name", "Use the same name as your old database, so your old data loads. Default: telegram_store_bot", "text", "mono"],
+      ["DASHBOARD_USERNAME", "Dashboard username", "Login name for this dashboard", "text", ""],
+      ["DASHBOARD_PASSWORD", "Dashboard password", "At least 8 characters. Leave empty to keep the current one.", "password", ""],
+    ];
+    const boot = c.boot || {};
+    const row = ([k, label, desc, type, cls], value) => `<div class="field" style="grid-column:auto">
+        <label>${esc(label)}</label>
+        <input data-cfg="${k}" type="${type}" value="${esc(value)}" autocomplete="off" spellcheck="false" class="${cls}">
+        <div class="hint">${esc(desc)}</div></div>`;
+    const status = c.first_run
+      ? `<span class="pill warn">First setup: fill the details below</span>`
+      : c.configured
+        ? `<span class="pill ok">Bot is configured</span>`
+        : `<span class="pill warn">Setup required, the bot is not running yet</span>`;
+    const codeCard = c.first_run
+      ? `<div class="card"><h3>Setup code</h3>
+          <p class="sub-h">Look at the terminal where bot.py is running. A 6-digit code is shown there. Type it here.</p>
+          <div class="field"><label>Setup code *</label><input data-cfg="SETUP_CODE" inputmode="numeric" autocomplete="off" class="mono"></div></div>`
+      : "";
+    const hook = c.webhook_url
+      ? `<div class="field" style="margin-top:14px"><label>SMS webhook URL (paste this in your SMS forwarding app)</label>
+           <div style="display:flex;gap:8px"><input readonly value="${esc(c.webhook_url)}" class="mono" style="font-size:12px">
+           <button class="btn" data-act="copy-webhook" style="white-space:nowrap">Copy</button></div>
+           <div class="hint">Use your https:// address, not the http one.</div></div>` : "";
+    $("#list").innerHTML = `
+      ${codeCard}
+      <div class="card"><h3>Bot status</h3><p class="sub-h">${status}</p>
+        <p class="sub-h" style="margin:0">Fields marked * are required. After you save, the bot restarts by itself in a few seconds.</p></div>
+      <div class="card"><h3>MongoDB and dashboard login</h3>
+        <p class="sub-h">Saved in a small file on the server, so the bot can connect to your database.</p>
+        <div class="form-grid">${BOOT.map(f => row(f, boot[f[0]])).join("")}</div></div>
+      <div class="card"><h3>Bot settings</h3><p class="sub-h">Token, IDs and payment details are saved in your database.</p>
+        <div class="form-grid">${FIELDS.map(f => row(f, c.values[f[0]])).join("")}</div>
+        ${hook}
+        <div style="margin-top:18px;display:flex;justify-content:flex-end"><button class="btn primary" data-act="save-config">Save and restart bot</button></div>
+      </div>`;
+  },
+
   settings: c => {
     const opt = (cur, list) => list.map(([v, l]) => `<option value="${v}" ${Number(cur) === v ? "selected" : ""}>${l}</option>`).join("");
     const tgl = (key, label, desc, on) => `<div class="toggle-row"><div class="lbl">${label}<small>${desc}</small></div><input type="checkbox" data-setting="${key}" ${on ? "checked" : ""}></div>`;
@@ -2952,6 +3165,8 @@ const RENDER = {
           ${tgl("auto_del_broadcasts", "Remove broadcast messages", "Recommended", c.auto_del_broadcasts)}
           ${tgl("auto_del_purchases", "Remove purchased links", "Customers lose old links from chat", c.auto_del_purchases)}
         </div></div>
+      <div class="card"><h3>Content protection</h3><p class="sub-h">Stops customers from forwarding or saving course content.</p>
+        ${tgl("protect_content", "Protect course content", "Works right away, no restart needed", c.protect_content)}</div>
       <div class="card"><h3>Clear chats now</h3><p class="sub-h">Removes promos and broadcasts from all chats immediately.</p>
         <button class="btn danger" data-act="force-clear">${svg("trash")}Clear now</button></div>`;
   },
@@ -2959,17 +3174,34 @@ const RENDER = {
 
 /* ============ search ============ */
 function renderSearch(list){
-  $("#list").innerHTML = list.length ? list.map(u => `<div class="user">
+  if(!list.length){ $("#list").innerHTML = empty("No user found for this ID or username."); return; }
+  $("#list").innerHTML = list.map(u => {
+    const chips = (u.channels || []).length
+      ? u.channels.map(n => `<span class="pill">${esc(n)}</span>`).join("")
+      : `<span class="muted" style="font-size:13px">Not joined to any channel yet</span>`;
+    const rows = u.purchases.length
+      ? u.purchases.map(p => `<div class="purch"><div class="grow">
+          <div class="t">${esc(p.channel_name || p.title)}</div>
+          <div class="m"><span class="pill">${esc(p.date || "no date")}</span>${p.channel_name ? `<span class="pill">${esc(p.title)}</span>` : ""}<span class="pill mono">${esc(p.course_id)}</span></div>
+        </div>
+        <span class="mono" style="white-space:nowrap;align-self:center">${p.rate != null ? money(p.rate) : "—"}</span>
+        <button class="btn danger sm" data-act="rm-purchase" data-uid="${esc(u.user_id)}" data-cid="${esc(p.course_id)}">${svg("trash")}Remove</button></div>`).join("")
+      : `<div class="muted" style="font-size:13px;margin-top:10px">No purchases yet.</div>`;
+    return `<div class="user">
       <div class="user-head"><div><span class="name">@${esc(u.username || "none")}</span> <span class="mono dim">${esc(u.user_id)}</span></div>
-      <span class="pill ${u.purchases.length ? "solid" : ""}">${u.purchases.length} course${u.purchases.length === 1 ? "" : "s"}</span></div>
-      ${purchasesHtml(u.user_id, u.purchases)}</div>`).join("")
-    : empty("No user found for this ID or username.");
+        <span class="pill ${u.purchases.length ? "solid" : ""}">${u.purchases.length} purchase${u.purchases.length === 1 ? "" : "s"}</span></div>
+      <div style="margin-top:14px"><div class="label-s">Channels joined</div><div class="chips">${chips}</div></div>
+      <div style="margin-top:18px"><div class="label-s">Purchase history</div>${rows}</div>
+      <div class="total-row"><span>Total spent</span><strong>${money(u.total)}</strong></div>
+    </div>`;
+  }).join("");
 }
 
-async function doSearch(q){
+async function doSearch(q, push = true){
   q = (q || "").trim();
   if(!q) return;
   lastQuery = q;
+  if(push) pushState("#search=" + encodeURIComponent(q));
   view = "search";
   closeAll();
   highlightNav(null);
@@ -2985,8 +3217,18 @@ async function doSearch(q){
   }
 }
 
-function go(v){
+/* ============ history: Back button and browser Back both work ============ */
+const pushState = hash => { if(location.hash !== hash) history.pushState({h: hash}, "", hash); };
+function routeFromHash(){
+  const h = decodeURIComponent(location.hash.replace(/^#/, ""));
+  if(h.startsWith("search=")){ doSearch(h.slice(7), false); return; }
+  go(TITLES[h] ? h : "home", false);
+}
+window.addEventListener("popstate", routeFromHash);
+
+function go(v, push = true){
   view = v;
+  if(push) pushState("#" + v);
   closeAll();
   highlightNav(v);
   $("#page-title").textContent = TITLES[v];
@@ -3074,6 +3316,25 @@ const ACTIONS = {
     await api("/dashboard/api/force-clear-chats", {method: "POST", body: {del_promos: true, del_broadcasts: true, del_purchases: false}});
     toast("Clearing started");
   },
+  "save-config": async () => {
+    const body = {};
+    document.querySelectorAll("[data-cfg]").forEach(i => { body[i.dataset.cfg] = i.value; });
+    const r = await api("/dashboard/api/config", {method: "POST", body});
+    const f = r.found || {};
+    toast(`Old data found: ${f.courses||0} courses, ${f.users||0} users, ${f.purchases||0} purchases, ${f.orders||0} orders. Bot is restarting.`);
+    setTimeout(() => location.reload(), 6000);
+  },
+  "copy-webhook": async el => {
+    const v = el.closest(".field").querySelector("input").value;
+    try { await navigator.clipboard.writeText(v); toast("Webhook URL copied"); }
+    catch(e) { toast("Copy failed, select the text and copy it manually", "err"); }
+  },
+  "open-setup": () => { closeMenu(); go("setup"); },
+  "logout": async () => {
+    closeMenu();
+    try { await fetch("/dashboard/logout", {method: "POST"}); } catch(e) {}
+    location.reload();
+  },
   "open-admins": () => { closeMenu(); openAdmins(); },
   "refresh": () => {
     closeMenu();
@@ -3128,7 +3389,7 @@ document.addEventListener("change", async e => {
     await api("/dashboard/api/system-settings", {method: "POST", body: {
       maintenance: get("maintenance"), cleanup_seconds: get("cleanup_seconds"),
       auto_del_promos: get("auto_del_promos"), auto_del_broadcasts: get("auto_del_broadcasts"),
-      auto_del_purchases: get("auto_del_purchases"), course_timer_minutes: get("course_timer_minutes"),
+      auto_del_purchases: get("auto_del_purchases"), protect_content: get("protect_content"), course_timer_minutes: get("course_timer_minutes"),
     }});
     delete cache.settings;
     toast("Settings saved");
@@ -3190,6 +3451,7 @@ const closeMenu = () => $("#profile-menu").classList.remove("open");
 const closeAll = () => { closeDrawer(); closeMenu(); };
 
 $("#btn-menu").onclick = openDrawer;
+$("#btn-back").onclick = () => history.back();
 $("#overlay").onclick = closeDrawer;
 $("#btn-avatar").onclick = e => { e.stopPropagation(); $("#profile-menu").classList.toggle("open"); };
 $("#search-form").onsubmit = e => { e.preventDefault(); doSearch($("#q").value); };
@@ -3219,7 +3481,9 @@ setInterval(() => {
 }, 30000);
 
 buildNav();
-go("home");
+api("/dashboard/api/config")
+  .then(c => { if(location.hash) routeFromHash(); else go(c.configured ? "home" : "setup", false); })
+  .catch(() => routeFromHash());
 </script>
 </body>
 </html>
@@ -3253,9 +3517,234 @@ def api_delete_admin(uid):
     refresh_admin_cache()
     return jsonify({"status": "success"})
 
-@app.route("/dashboard")
+def _mask(v):
+    v = str(v or "")
+    if len(v) <= 10: return "•" * len(v)
+    return v[:6] + "••••••" + v[-4:]
+
+@app.before_request
+def _gate_until_setup():
+    """Setup पूरा न होने तक बाकी routes बंद रहते हैं (सिर्फ़ dashboard page और config खुले रहते हैं)"""
+    if BOT_CONFIGURED: return None
+    p = request.path
+    if p in ("/dashboard", "/dashboard/login", "/dashboard/logout", "/dashboard/icon.svg", "/dashboard/manifest.json") or p.startswith("/dashboard/api/config"):
+        return None
+    if p.startswith("/dashboard"):
+        return jsonify({"error": "Setup is not complete yet. Open 'Add Bot / Setup' and save.", "setup_required": True}), 503
+    if p.startswith("/sms-webhook/"):
+        return "Setup pending", 503
+    return None
+
+def _boot_public():
+    """Dashboard में दिखने वाली boot values: MongoDB link masked रहता है, password कभी नहीं दिखता"""
+    return {
+        "MONGO_URI": _mask(MONGO_URI),
+        "MONGO_DB_NAME": MONGO_DB_NAME,
+        "DASHBOARD_USERNAME": DASHBOARD_USERNAME,
+        "DASHBOARD_PASSWORD": "",
+    }
+
+def _check_mongo(uri, name):
+    """नए MongoDB link को जाँचता है। ठीक हो तो उस database का object लौटाता है।"""
+    client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=8000)
+    client.admin.command("ping")
+    return client.get_database(name)
+
+@app.route("/dashboard/api/config", methods=["GET", "POST"])
 @require_auth
-def dashboard_page(): return DASHBOARD_HTML
+def api_config():
+    if request.method == "GET":
+        if not DASHBOARD_PASSWORD:
+            return jsonify({"configured": False, "first_run": True, "webhook_url": "",
+                            "values": dict(BOT_CONFIG_KEYS), "boot": _boot_public()})
+        cfg = load_bot_config()
+        secret = cfg.get("SMS_HOOK_SECRET", "")
+        return jsonify({
+            "configured": BOT_CONFIGURED,
+            "first_run": False,
+            "webhook_url": (request.host_url.rstrip("/") + "/sms-webhook/" + secret) if secret else "",
+            "values": {
+                "BOT_TOKEN": _mask(cfg.get("BOT_TOKEN", "")),
+                "ADMIN_ID": cfg.get("ADMIN_ID", ""),
+                "DB_CHANNEL_ID": cfg.get("DB_CHANNEL_ID", ""),
+                "UPI_ID": cfg.get("UPI_ID", ""),
+                "MERCHANT_NAME": cfg.get("MERCHANT_NAME", ""),
+                "SMS_HOOK_SECRET": secret,
+                "CHAT_LINK": cfg.get("CHAT_LINK", ""),
+                "INTERNATIONAL_LINK": cfg.get("INTERNATIONAL_LINK", ""),
+                "QR_EXPIRY_MINUTES": cfg.get("QR_EXPIRY_MINUTES", "10"),
+                "STALE_ORDER_HOURS": cfg.get("STALE_ORDER_HOURS", "24"),
+                "SMS_POOL_TTL_HOURS": cfg.get("SMS_POOL_TTL_HOURS", "5"),
+                "ORDER_TTL_HOURS": cfg.get("ORDER_TTL_HOURS", "48"),
+            },
+            "boot": _boot_public(),
+        })
+
+    d = request.get_json(silent=True) or {}
+    if not DASHBOARD_PASSWORD and str(d.get("SETUP_CODE", "")).strip() != SETUP_CODE:
+        return jsonify({"error": "Setup code गलत है। Terminal में दिखा 6-digit code डालें।"}), 403
+
+    # ---- 1. MongoDB + dashboard login (boot file में जाते हैं) ----
+    boot_new = {}
+    uri = str(d.get("MONGO_URI") or "").strip()
+    if uri and "•" not in uri:
+        if not re.match(r"^mongodb(\+srv)?://\S+$", uri):
+            return jsonify({"error": "MongoDB URL 'mongodb://' या 'mongodb+srv://' से शुरू होना चाहिए।"}), 400
+        boot_new["MONGO_URI"] = uri
+    else:
+        uri = MONGO_URI
+    if not uri:
+        return jsonify({"error": "MongoDB URL भरें।"}), 400
+
+    name = str(d.get("MONGO_DB_NAME") or "").strip() or MONGO_DB_NAME
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{1,63}", name):
+        return jsonify({"error": "Database name में सिर्फ़ letters, numbers, - या _ हों।"}), 400
+    boot_new["MONGO_DB_NAME"] = name
+
+    uname = str(d.get("DASHBOARD_USERNAME") or "").strip() or DASHBOARD_USERNAME
+    boot_new["DASHBOARD_USERNAME"] = uname
+
+    pw = str(d.get("DASHBOARD_PASSWORD") or "")
+    if pw:
+        if len(pw) < 8 or pw == "changeme123":
+            return jsonify({"error": "Dashboard password कम से कम 8 अक्षर का हो।"}), 400
+        boot_new["DASHBOARD_PASSWORD"] = pw
+    if not (pw or DASHBOARD_PASSWORD):
+        return jsonify({"error": "Dashboard password भरें।"}), 400
+
+    try:
+        target_db = _check_mongo(uri, name)
+    except Exception as e:
+        return jsonify({"error": "MongoDB से connect नहीं हो पा रहा। URL और password जाँचें, और Atlas में Network Access सही है या नहीं देखें. (" + str(e)[:160] + ")"}), 400
+
+    # पुराना डेटा मिला या नहीं, यह पहले जाँचते हैं। कुछ न मिले तो कुछ भी सेव नहीं होता।
+    try:
+        found = {c: target_db[c].estimated_document_count() for c in ("courses", "users", "purchases", "orders")}
+    except Exception as e:
+        return jsonify({"error": "Database से डेटा नहीं पढ़ पा रहा: " + str(e)[:160] + ". कुछ सेव नहीं किया गया है।"}), 400
+    if not any(found.values()):
+        return jsonify({"error": f"इस database ('{name}') में पुराना डेटा नहीं मिला। Database नाम और URL जाँचें। कुछ सेव नहीं किया गया है।"}), 400
+
+    # ---- 2. Bot settings (MongoDB के settings doc में जाती हैं) ----
+    cur = load_bot_config(target_db)
+    new = {}
+    for k in BOT_CONFIG_KEYS:
+        if k not in d: continue
+        v = str(d.get(k) or "").strip()
+        if k == "BOT_TOKEN" and (not v or "•" in v):
+            continue  # खाली या masked है, तो पुराना token ही रहेगा
+        if k == "BOT_TOKEN" and not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{20,}", v):
+            return jsonify({"error": "Bot token looks wrong. Paste the full token from BotFather."}), 400
+        if k == "ADMIN_ID" and v and not re.fullmatch(r"\d{5,15}", v):
+            return jsonify({"error": "Owner ID must be a numeric Telegram ID."}), 400
+        if k == "DB_CHANNEL_ID" and v and not re.fullmatch(r"-?\d{5,20}", v):
+            return jsonify({"error": "Channel ID must be a number (usually starts with -100)."}), 400
+        if k == "SMS_HOOK_SECRET" and v and not re.fullmatch(r"[A-Za-z0-9_\-]{12,}", v):
+            return jsonify({"error": "SMS secret: use 12+ letters, numbers, - or _ only."}), 400
+        if k.endswith("_HOURS") or k.endswith("_MINUTES"):
+            if v and not re.fullmatch(r"\d+(\.\d+)?", v):
+                return jsonify({"error": f"{k} must be a number."}), 400
+        new[k] = v
+
+    merged = {**cur, **new}
+    if not merged.get("SMS_HOOK_SECRET"):
+        merged["SMS_HOOK_SECRET"] = secrets.token_urlsafe(24)
+        new["SMS_HOOK_SECRET"] = merged["SMS_HOOK_SECRET"]
+    missing = [k for k in ("BOT_TOKEN", "ADMIN_ID", "DB_CHANNEL_ID", "UPI_ID") if not merged.get(k)]
+    if missing:
+        return jsonify({"error": "Required: " + ", ".join(missing)}), 400
+
+    new["updated_at"] = get_ist_time()
+    target_db["settings"].update_one({"_id": "bot_config"}, {"$set": new}, upsert=True)
+    save_boot(boot_new)
+
+    # नई settings पूरी तरह लागू करने के लिए बोट अपने-आप restart होता है
+    threading.Thread(target=_restart_later, daemon=True).start()
+    return jsonify({"status": "success", "restarting": True, "found": found})
+
+def _restart_later():
+    time.sleep(2)
+    print("🔄 Restarting bot with new settings...", flush=True)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dashboard login</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#f2f2f2;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif}
+.wrap{min-height:100%;display:grid;place-items:center;padding:24px;box-sizing:border-box}
+.card{width:100%;max-width:380px;background:#0a0a0a;border:1px solid #1f1f1f;border-radius:18px;padding:32px 28px;box-shadow:0 30px 80px rgba(0,0,0,.8);box-sizing:border-box}
+.logo{width:48px;height:48px;border-radius:14px;background:#fff;color:#000;display:grid;place-items:center;font-weight:800;font-size:22px;margin:0 auto 18px}
+h1{font-size:20px;margin:0 0 6px;text-align:center;font-weight:600}
+p.sub{margin:0 0 24px;color:#8a8a8a;font-size:13.5px;text-align:center}
+label{display:block;font-size:12.5px;color:#8a8a8a;margin:14px 0 6px}
+input{width:100%;box-sizing:border-box;background:#000;border:1px solid #2a2a2a;border-radius:12px;padding:12px 14px;color:#f2f2f2;font:inherit;font-size:15px;outline:none;transition:border-color .15s}
+input:focus{border-color:#555}
+button{margin-top:22px;width:100%;padding:12px;border:0;border-radius:12px;background:#fff;color:#000;font:inherit;font-weight:600;font-size:15px;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+.err{min-height:20px;color:#f87171;font-size:13px;text-align:center;margin-top:14px}
+</style></head>
+<body>
+<div class="wrap">
+<form class="card" id="f" autocomplete="on">
+  <div class="logo">S</div>
+  <h1>Dashboard login</h1>
+  <p class="sub">Sign in to manage your store</p>
+  <label for="u">Username</label>
+  <input id="u" name="username" autocomplete="username" required>
+  <label for="p">Password</label>
+  <input id="p" name="password" type="password" autocomplete="current-password" required>
+  <button id="b" type="submit">Sign in</button>
+  <div class="err" id="err"></div>
+</form>
+</div>
+<script>
+document.getElementById("f").onsubmit = async e => {
+  e.preventDefault();
+  const b = document.getElementById("b"), err = document.getElementById("err");
+  b.disabled = true; err.textContent = "";
+  try {
+    const r = await fetch("/dashboard/login", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({username: document.getElementById("u").value, password: document.getElementById("p").value})});
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) { location.reload(); return; }
+    err.textContent = d.error || "Login failed";
+  } catch (x) { err.textContent = "Network error. Try again."; }
+  b.disabled = false;
+};
+</script>
+</body></html>
+"""
+
+@app.route("/dashboard/login", methods=["POST"])
+def dashboard_login():
+    ip = request.remote_addr or "?"
+    if _login_blocked(ip):
+        return jsonify({"error": "बहुत बार गलत कोशिश हुई। 15 मिनट बाद फिर कोशिश करें।"}), 429
+    d = request.get_json(silent=True) or {}
+    u = str(d.get("username") or "").strip()
+    p = str(d.get("password") or "")
+    if DASHBOARD_PASSWORD and hmac.compare_digest(u.encode(), DASHBOARD_USERNAME.encode()) \
+            and hmac.compare_digest(p.encode(), DASHBOARD_PASSWORD.encode()):
+        session.clear()
+        session.permanent = True
+        session["dash_ok"] = True
+        _login_fail.pop(ip, None)
+        return jsonify({"ok": True})
+    _login_fail.setdefault(ip, []).append(time.time())
+    return jsonify({"error": "Username या password गलत है।"}), 401
+
+@app.route("/dashboard/logout", methods=["POST"])
+def dashboard_logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+@app.route("/dashboard")
+def dashboard_page():
+    # Login नहीं है तो अपना login page दिखता है (browser का popup नहीं)
+    if not DASHBOARD_PASSWORD or _is_logged_in():
+        return DASHBOARD_HTML
+    return LOGIN_HTML
 
 # ==========================================
 # 🔄 GLOBAL THREADS
@@ -3306,12 +3795,18 @@ def start_polling():
             time.sleep(5)
 
 if __name__ == "__main__":
-    try: BOT_USERNAME = bot.get_me().username
-    except Exception: pass
-    
-    restore_pending_orders()
-    threading.Thread(target=global_sms_checker, daemon=True).start()
-    threading.Thread(target=global_memory_cleanup, daemon=True).start()
-    threading.Thread(target=start_polling, daemon=True).start()
-    
+    if not DASHBOARD_PASSWORD:
+        print(f"🔐 पहली बार setup: Dashboard में यह 6-digit code डालें → {SETUP_CODE}", flush=True)
+    if BOT_CONFIGURED:
+        # सारी settings पूरी हों तो ही बोट चलता है
+        try: BOT_USERNAME = bot.get_me().username
+        except Exception as e: print(f"⚠️ Bot token check failed: {e}")
+        restore_pending_orders()
+        threading.Thread(target=global_sms_checker, daemon=True).start()
+        threading.Thread(target=global_memory_cleanup, daemon=True).start()
+        threading.Thread(target=start_polling, daemon=True).start()
+    else:
+        print("🛠 Setup mode: Dashboard में 'Add Bot / Setup' खोलें और settings भरें।", flush=True)
+
+    # Dashboard हमेशा चलता है, ताकि settings वहीं से भरी जा सकें
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
