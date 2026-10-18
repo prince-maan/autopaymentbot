@@ -6,6 +6,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -38,6 +39,7 @@ from telebot.types import (
 # MongoDB link और Dashboard login एक छोटी फाइल में रहते हैं (आपके home folder में)।
 # इन्हें Dashboard के "Add Bot / Setup" में भरा जाता है। पुराने environment variables भी चलते हैं।
 BOOT_FILE = os.path.join(os.path.expanduser("~"), ".telegram_store_bot_boot.json")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BOOT_DEFAULT_DB = "telegram_store_bot"
 
 def load_boot():
@@ -2822,6 +2824,7 @@ main{padding:84px 18px 56px;max-width:1040px;margin:0 auto}
   <button data-act="open-admins">Admins</button>
   <button data-act="refresh">Refresh</button>
   <hr>
+  <button data-act="update-code">Update code</button>
   <button data-act="logout">Log out</button>
   <button data-act="close-menu">Close</button>
 </div>
@@ -3096,33 +3099,16 @@ const RENDER = {
   },
 
   setup: c => {
-    const FIELDS = [
-      ["BOT_TOKEN", "Bot token *", "From BotFather. Shown masked. Leave it as it is to keep the current token.", "text", "mono"],
-      ["ADMIN_ID", "Owner Telegram ID *", "Your numeric Telegram ID. You are always an admin.", "text", ""],
-      ["DB_CHANNEL_ID", "Private channel / log group ID *", "Usually starts with -100. Add the bot there as admin first.", "text", ""],
-      ["UPI_ID", "UPI ID *", "For example name@bank", "text", ""],
-      ["MERCHANT_NAME", "Merchant name", "Shown on the UPI payment screen", "text", ""],
-      ["SMS_HOOK_SECRET", "SMS webhook secret", "Leave empty to generate one automatically", "text", "mono"],
-      ["CHAT_LINK", "Contact link", "Optional. For example https://t.me/yourname", "text", ""],
-      ["INTERNATIONAL_LINK", "International payment link", "Optional", "text", ""],
-      ["QR_EXPIRY_MINUTES", "QR expiry (minutes)", "Default 10", "text", ""],
-      ["STALE_ORDER_HOURS", "Stale order window (hours)", "Default 24", "text", ""],
-      ["SMS_POOL_TTL_HOURS", "SMS pool keep time (hours)", "Default 5", "text", ""],
-      ["ORDER_TTL_HOURS", "Order keep time (hours)", "Default 48", "text", ""],
-    ];
-    const BOOT = [
-      ["MONGO_URI", "MongoDB URL *", "Your MongoDB connection link. Shown masked. Leave it as it is to keep the current one.", "text", "mono"],
-      ["MONGO_DB_NAME", "Database name", "Use the same name as your old database, so your old data loads. Default: telegram_store_bot", "text", "mono"],
-      ["DASHBOARD_USERNAME", "Dashboard username", "Login name for this dashboard", "text", ""],
-      ["DASHBOARD_PASSWORD", "Dashboard password", "At least 8 characters. Leave empty to keep the current one.", "password", ""],
-    ];
-    const boot = c.boot || {};
-    const row = ([k, label, desc, type, cls], value) => `<div class="field" style="grid-column:auto">
+    const v = c.values || {}, boot = c.boot || {};
+    const row = ([k, label, desc, type = "text", cls = ""], value) => `<div class="field" style="grid-column:auto">
         <label>${esc(label)}</label>
         <input data-cfg="${k}" type="${type}" value="${esc(value)}" autocomplete="off" spellcheck="false" class="${cls}">
         <div class="hint">${esc(desc)}</div></div>`;
+    const section = (title, sub, rows) => `<div class="card"><h3>${esc(title)}</h3><p class="sub-h">${esc(sub)}</p>
+        <div class="form-grid">${rows}</div></div>`;
+
     const status = c.first_run
-      ? `<span class="pill warn">First setup: fill the details below</span>`
+      ? `<span class="pill warn">First setup: fill the sections below</span>`
       : c.configured
         ? `<span class="pill ok">Bot is configured</span>`
         : `<span class="pill warn">Setup required, the bot is not running yet</span>`;
@@ -3131,23 +3117,76 @@ const RENDER = {
           <p class="sub-h">Look at the terminal where bot.py is running. A 6-digit code is shown there. Type it here.</p>
           <div class="field"><label>Setup code *</label><input data-cfg="SETUP_CODE" inputmode="numeric" autocomplete="off" class="mono"></div></div>`
       : "";
-    const hook = c.webhook_url
-      ? `<div class="field" style="margin-top:14px"><label>SMS webhook URL (paste this in your SMS forwarding app)</label>
-           <div style="display:flex;gap:8px"><input readonly value="${esc(c.webhook_url)}" class="mono" style="font-size:12px">
-           <button class="btn" data-act="copy-webhook" style="white-space:nowrap">Copy</button></div>
-           <div class="hint">Use your https:// address, not the http one.</div></div>` : "";
+
+    const mongo = section("1. MongoDB database",
+      "Saved on the server file, so the bot can connect to your data. Change this only when you move to another database.",
+      [
+        row(["MONGO_URI", "MongoDB URL *", "Shown masked. Leave it as it is to keep the current one.", "text", "mono"], boot.MONGO_URI),
+        row(["MONGO_DB_NAME", "Database name", "Same name as your old database, so old data loads. Default: telegram_store_bot", "text", "mono"], boot.MONGO_DB_NAME),
+        row(["DASHBOARD_USERNAME", "Dashboard username", "Login name for this dashboard", "text", ""], boot.DASHBOARD_USERNAME),
+        row(["DASHBOARD_PASSWORD", "Dashboard password", "At least 8 characters. Leave empty to keep the current one.", "password", ""], ""),
+      ].join(""));
+
+    const bot = section("2. Bot details",
+      "Saved in your database. Saving restarts the bot.",
+      [
+        row(["BOT_TOKEN", "Bot token *", "From BotFather. Shown masked. Leave it as it is to keep the current token.", "text", "mono"], v.BOT_TOKEN),
+        row(["ADMIN_ID", "Owner Telegram ID *", "Your numeric Telegram ID. You are always an admin.", "text", ""], v.ADMIN_ID),
+        row(["DB_CHANNEL_ID", "Private channel / log group ID *", "Usually starts with -100. Add the bot there as admin first.", "text", ""], v.DB_CHANNEL_ID),
+      ].join(""));
+
+    const payment = section("3. Payment details",
+      "Shown to buyers on the payment screen and in the start menu.",
+      [
+        row(["MERCHANT_NAME", "Merchant name", "Shown on the UPI payment screen", "text", ""], v.MERCHANT_NAME),
+        row(["UPI_ID", "UPI ID *", "For example name@bank", "text", ""], v.UPI_ID),
+        row(["CHAT_LINK", "Contact link", "Optional. For example https://t.me/yourname", "text", ""], v.CHAT_LINK),
+        row(["INTERNATIONAL_LINK", "International payment link", "Optional", "text", ""], v.INTERNATIONAL_LINK),
+      ].join(""));
+
+    const timers = section("4. QR & order timers",
+      "How long a payment QR stays valid and how long old orders are kept.",
+      [
+        row(["QR_EXPIRY_MINUTES", "QR expiry (minutes)", "Default 10", "text", ""], v.QR_EXPIRY_MINUTES),
+        row(["STALE_ORDER_HOURS", "Stale order window (hours)", "Default 24", "text", ""], v.STALE_ORDER_HOURS),
+        row(["ORDER_TTL_HOURS", "Order keep time (hours)", "Default 48", "text", ""], v.ORDER_TTL_HOURS),
+      ].join(""));
+
+    const pool = section("5. SMS pool",
+      "Bank SMS messages that wait to be matched with a payment.",
+      [
+        row(["SMS_POOL_TTL_HOURS", "SMS pool keep time (hours)", "Default 5", "text", ""], v.SMS_POOL_TTL_HOURS),
+      ].join(""));
+
+    const hook = `<div class="card"><h3>6. SMS webhook</h3>
+        <p class="sub-h">Paste the link below into your SMS forwarding app. Change the secret and the link updates by itself.</p>
+        <div class="field"><label>Webhook secret</label>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <input data-cfg="SMS_HOOK_SECRET" id="wh-secret" value="${esc(v.SMS_HOOK_SECRET)}" autocomplete="off" spellcheck="false" class="mono" style="flex:1;min-width:200px">
+            <button class="btn" data-act="gen-secret" type="button">Generate</button></div>
+          <div class="hint">Leave empty and it is created automatically on Save. Use letters, numbers, - or _ (at least 12).</div></div>
+        <div class="field" style="margin-top:14px"><label>Webhook URL (copy this)</label>
+          <div style="display:flex;gap:8px"><input readonly id="wh-url" class="mono" style="font-size:12px" value="">
+            <button class="btn" data-act="copy-webhook" type="button" style="white-space:nowrap">Copy</button></div>
+          <div class="hint">Use your https:// address, not the http one. The link works after you Save.</div></div>
+      </div>`;
+
     $("#list").innerHTML = `
       ${codeCard}
       <div class="card"><h3>Bot status</h3><p class="sub-h">${status}</p>
         <p class="sub-h" style="margin:0">Fields marked * are required. After you save, the bot restarts by itself in a few seconds.</p></div>
-      <div class="card"><h3>MongoDB and dashboard login</h3>
-        <p class="sub-h">Saved in a small file on the server, so the bot can connect to your database.</p>
-        <div class="form-grid">${BOOT.map(f => row(f, boot[f[0]])).join("")}</div></div>
-      <div class="card"><h3>Bot settings</h3><p class="sub-h">Token, IDs and payment details are saved in your database.</p>
-        <div class="form-grid">${FIELDS.map(f => row(f, c.values[f[0]])).join("")}</div>
-        ${hook}
-        <div style="margin-top:18px;display:flex;justify-content:flex-end"><button class="btn primary" data-act="save-config">Save and restart bot</button></div>
-      </div>`;
+      ${mongo}${bot}${payment}${timers}${pool}${hook}
+      <div style="display:flex;justify-content:flex-end;margin:4px 0 24px"><button class="btn primary" data-act="save-config">Save and restart bot</button></div>`;
+
+    // Webhook link: builds itself as you type the secret
+    const base = c.webhook_base || "";
+    const sec = document.getElementById("wh-secret"), out = document.getElementById("wh-url");
+    const refreshUrl = () => {
+      const s = sec.value.trim();
+      out.value = s ? base + s : "Generate दबाएं या secret डालें";
+    };
+    sec.oninput = refreshUrl;
+    refreshUrl();
   },
 
   settings: c => {
@@ -3330,6 +3369,28 @@ const ACTIONS = {
     catch(e) { toast("Copy failed, select the text and copy it manually", "err"); }
   },
   "open-setup": () => { closeMenu(); go("setup"); },
+  "gen-secret": () => {
+    const a = new Uint8Array(24);
+    crypto.getRandomValues(a);
+    const s = btoa(String.fromCharCode(...a)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const inp = document.getElementById("wh-secret");
+    inp.value = s;
+    inp.dispatchEvent(new Event("input"));
+    toast("New secret generated. Save to use it.");
+  },
+  "update-code": async () => {
+    closeMenu();
+    const ok = await confirmBox({title: "Update code from GitHub?",
+      text: "The server will run git pull and restart the bot. Takes about 10 to 30 seconds.", okText: "Update", danger: false});
+    if(!ok) return;
+    try {
+      const r = await api("/dashboard/api/update-code", {method: "POST"});
+      toast(r.message || "Done");
+      if(r.status === "updated") setTimeout(() => location.reload(), 10000);
+    } catch(e) {
+      toast(e.message, "err");
+    }
+  },
   "logout": async () => {
     closeMenu();
     try { await fetch("/dashboard/logout", {method: "POST"}); } catch(e) {}
@@ -3556,6 +3617,7 @@ def api_config():
     if request.method == "GET":
         if not DASHBOARD_PASSWORD:
             return jsonify({"configured": False, "first_run": True, "webhook_url": "",
+                            "webhook_base": request.host_url.rstrip("/") + "/sms-webhook/",
                             "values": dict(BOT_CONFIG_KEYS), "boot": _boot_public()})
         cfg = load_bot_config()
         secret = cfg.get("SMS_HOOK_SECRET", "")
@@ -3563,6 +3625,7 @@ def api_config():
             "configured": BOT_CONFIGURED,
             "first_run": False,
             "webhook_url": (request.host_url.rstrip("/") + "/sms-webhook/" + secret) if secret else "",
+            "webhook_base": request.host_url.rstrip("/") + "/sms-webhook/",
             "values": {
                 "BOT_TOKEN": _mask(cfg.get("BOT_TOKEN", "")),
                 "ADMIN_ID": cfg.get("ADMIN_ID", ""),
@@ -3590,11 +3653,11 @@ def api_config():
     if uri and "•" not in uri:
         if not re.match(r"^mongodb(\+srv)?://\S+$", uri):
             return jsonify({"error": "MongoDB URL 'mongodb://' या 'mongodb+srv://' से शुरू होना चाहिए।"}), 400
-        boot_new["MONGO_URI"] = uri
     else:
         uri = MONGO_URI
     if not uri:
         return jsonify({"error": "MongoDB URL भरें।"}), 400
+    boot_new["MONGO_URI"] = uri  # हमेशा सेव, ताकि boot file अपने-आप पूरी रहे
 
     name = str(d.get("MONGO_DB_NAME") or "").strip() or MONGO_DB_NAME
     if not re.fullmatch(r"[A-Za-z0-9_\-]{1,63}", name):
@@ -3611,6 +3674,7 @@ def api_config():
         boot_new["DASHBOARD_PASSWORD"] = pw
     if not (pw or DASHBOARD_PASSWORD):
         return jsonify({"error": "Dashboard password भरें।"}), 400
+    boot_new["DASHBOARD_PASSWORD"] = pw or DASHBOARD_PASSWORD
 
     try:
         target_db = _check_mongo(uri, name)
@@ -3632,7 +3696,10 @@ def api_config():
         if k not in d: continue
         v = str(d.get(k) or "").strip()
         if k == "BOT_TOKEN" and (not v or "•" in v):
-            continue  # खाली या masked है, तो पुराना token ही रहेगा
+            # खाली या masked है: मौजूदा token (MongoDB या पुराने env से) MongoDB में भी सेव कर देते हैं
+            if cur.get("BOT_TOKEN"):
+                new["BOT_TOKEN"] = cur["BOT_TOKEN"]
+            continue
         if k == "BOT_TOKEN" and not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{20,}", v):
             return jsonify({"error": "Bot token looks wrong. Paste the full token from BotFather."}), 400
         if k == "ADMIN_ID" and v and not re.fullmatch(r"\d{5,15}", v):
@@ -3738,6 +3805,36 @@ def dashboard_login():
 def dashboard_logout():
     session.clear()
     return jsonify({"ok": True})
+
+@app.route("/dashboard/api/update-code", methods=["POST"])
+@require_auth
+def api_update_code():
+    """GitHub से नया code लाता है (git pull) और ज़रूरत हो तो packages लगाकर बोट को restart करता है"""
+    if not os.path.isdir(os.path.join(APP_DIR, ".git")):
+        return jsonify({"error": "यह फोल्डर GitHub से clone किया हुआ नहीं है (.git नहीं मिला)। पहले git clone करें।"}), 400
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}  # password न माँगे, बस error दे
+    def git(*args, timeout=120):
+        return subprocess.run(["git", *args], cwd=APP_DIR, capture_output=True, text=True, timeout=timeout, env=env)
+    try:
+        before = git("rev-parse", "HEAD", timeout=30).stdout.strip()
+        pull = git("pull", "--ff-only")
+        if pull.returncode != 0:
+            return jsonify({"error": "Git pull नहीं हो पाया। Server पर कोई local बदलाव या GitHub login की दिक्कत हो सकती है.",
+                            "details": (pull.stdout + pull.stderr).strip()[-800:]}), 400
+        after = git("rev-parse", "HEAD", timeout=30).stdout.strip()
+        if before == after:
+            return jsonify({"status": "up_to_date", "message": "पहले से नवीनतम code है। कुछ नहीं बदला।"})
+        changed = git("diff", "--name-only", before, after, timeout=30).stdout
+        if "requirements.txt" in changed:
+            pip = subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
+                                 cwd=APP_DIR, capture_output=True, text=True, timeout=600)
+            if pip.returncode != 0:
+                return jsonify({"error": "Code आ गया, पर packages नहीं लग पाए। Restart नहीं किया गया।",
+                                "details": (pip.stdout + pip.stderr).strip()[-800:]}), 500
+    except Exception as e:
+        return jsonify({"error": "Update में दिक्कत आई: " + str(e)[:200]}), 500
+    threading.Thread(target=_restart_later, daemon=True).start()
+    return jsonify({"status": "updated", "message": "नया code आ गया। बोट restart हो रहा है, कुछ सेकंड में नया page खुलेगा।"})
 
 @app.route("/dashboard")
 def dashboard_page():
