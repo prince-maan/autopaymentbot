@@ -163,6 +163,21 @@ def get_cleanup_settings():
         "del_purchases": cfg.get("auto_del_purchases", False)
     }
 
+def schedule_course_auto_delete(chat_id, message_ids):
+    """Schedules deletion of course/file contents if timer is set in Dashboard"""
+    if not message_ids: return
+    cfg = get_cached_setting("system_settings") or {}
+    mins = int(cfg.get("course_timer_minutes", 0))
+    if mins > 0:
+        def del_task():
+            for mid in message_ids:
+                try: bot.delete_message(chat_id, mid)
+                except: pass
+                with tracker_lock:
+                    if chat_id in user_chat_messages:
+                        user_chat_messages[chat_id] = [x for x in user_chat_messages[chat_id] if x["id"] != mid]
+        threading.Timer(mins * 60, del_task).start()
+
 # ==========================================
 # 📝 TEXT FORMATTING & ACTIVITY TRACKER
 # ==========================================
@@ -258,15 +273,13 @@ def tracked_send_document(chat_id, *args, **kwargs):
 bot.send_document = tracked_send_document
 bot.send_media_group = orig_send_media_group
 
-# # ==========================================
+# ==========================================
 # 📸 QR CODE & CUSTOM FRAME GENERATOR
 # ==========================================
-# frame.png (2048x2048) के अंदर के मापे गए पिक्सेल कोऑर्डिनेट्स.
-# अगर frame.png बदलो, तो ये नंबर फिर से मापने होंगे.
-FRAME_QR_BOX = (485, 552, 1562, 1631)      # सफ़ेद QR डिब्बा (left, top, right, bottom)
-QR_PADDING = 26                             # डिब्बे के हर तरफ़ हल्का सफ़ेद स्पेस
-FRAME_RUPEE_RIGHT = 1160                    # ₹ निशान का दाहिना किनारा
-FRAME_AMOUNT_BOX = (1061, 1742, 1445, 1872) # AMOUNT वाला सफ़ेद फ़ील्ड
+FRAME_QR_BOX = (485, 552, 1562, 1631)      
+QR_PADDING = 26                             
+FRAME_RUPEE_RIGHT = 1160                    
+FRAME_AMOUNT_BOX = (1061, 1742, 1445, 1872) 
 AMOUNT_MAX_FONT = 100
 AMOUNT_MIN_FONT = 40
 
@@ -278,26 +291,19 @@ FONT_PATHS = [
     "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
 ]
 
-
 def _load_amount_font(size):
     from PIL import ImageFont
     for path in FONT_PATHS:
         if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception as e:
-                print("Font load failed:", path, e)
-    # आखिरी fallback: Roboto डाउनलोड करने की कोशिश (सिर्फ़ तब जब कोई font फाइल न मिले)
+            try: return ImageFont.truetype(path, size)
+            except Exception: pass
     try:
         import urllib.request
         target = os.path.join(BASE_DIR, "Roboto-Bold.ttf")
         urllib.request.urlretrieve("https://github.com/google/fonts/raw/main/ofl/roboto/Roboto-Bold.ttf", target)
         return ImageFont.truetype(target, size)
-    except Exception as e:
-        print("Font download failed:", e)
-    # Pillow >= 10.1 में load_default(size) असली साइज़ से फ़ॉन्ट देता है
+    except Exception: pass
     return ImageFont.load_default(size=size)
-
 
 def generate_upi_qr(amount, order_id):
     from PIL import ImageFont, ImageDraw, Image
@@ -305,22 +311,17 @@ def generate_upi_qr(amount, order_id):
     clean_amt = re.sub(r"[^\d.]", "", str(amount))
     upi_url = f"upi://pay?pa={UPI_ID}&pn={MERCHANT_NAME}&am={clean_amt}&cu=INR&tn=Order_{order_id}"
 
-    # 1. बेसिक QR कोड बनाएं
     qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=1)
     qr.add_data(upi_url)
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGBA")
 
     try:
-        # 2. आपकी डिज़ाइन (frame.png) लोड करें
         background = Image.open(FRAME_PATH).convert("RGBA")
-
-        # --- QR: सफ़ेद डिब्बे के अंदर परफ़ेक्ट सेंटर में, हर तरफ़ बराबर पैडिंग ---
         box_l, box_t, box_r, box_b = FRAME_QR_BOX
         qr_size = min(box_r - box_l + 1, box_b - box_t + 1) - 2 * QR_PADDING
         qr_img = qr_img.resize((qr_size, qr_size), Image.Resampling.LANCZOS)
 
-        # किनारे हल्के गोल
         mask = Image.new("L", (qr_size, qr_size), 0)
         ImageDraw.Draw(mask).rounded_rectangle((0, 0, qr_size, qr_size), int(qr_size * 0.06), fill=255)
         qr_img.putalpha(mask)
@@ -329,7 +330,6 @@ def generate_upi_qr(amount, order_id):
         qr_y = (box_t + box_b + 1) // 2 - qr_size // 2
         background.paste(qr_img, (qr_x, qr_y), qr_img)
 
-        # --- AMOUNT: ₹ के ठीक आगे, सफ़ेद फ़ील्ड के बीच में (vertical center) ---
         draw = ImageDraw.Draw(background)
         amt_text = clean_amt
         f_l, f_t, f_r, f_b = FRAME_AMOUNT_BOX
@@ -338,7 +338,6 @@ def generate_upi_qr(amount, order_id):
         avail_w = text_right_limit - text_left
         field_cy = (f_t + f_b) // 2
 
-        # फ़ॉन्ट साइज़ auto-fit: सबसे बड़ा साइज़ जो पूरा अमाउंट फ़ील्ड की चौड़ाई में आ जाए
         font = None
         for size in range(AMOUNT_MAX_FONT, AMOUNT_MIN_FONT - 1, -2):
             candidate = _load_amount_font(size)
@@ -349,7 +348,6 @@ def generate_upi_qr(amount, order_id):
         if font is None:
             font = _load_amount_font(AMOUNT_MIN_FONT)
 
-        # अक्षरों की असली ऊँचाई (cap height) के हिसाब से vertical center
         l, t, r, b = font.getbbox(amt_text)
         ct_l, ct_t, ct_r, ct_b = font.getbbox("0")
         text_x = text_left - l
@@ -357,7 +355,6 @@ def generate_upi_qr(amount, order_id):
         draw.text((text_x, text_y), amt_text, font=font, fill="#1D3B70")
 
         final_img = background
-
     except Exception as ec:
         print(f"⚠️ Frame Error: {ec}")
         final_img = qr_img
@@ -366,8 +363,8 @@ def generate_upi_qr(amount, order_id):
     final_img.save(bio, "PNG")
     bio.seek(0)
     return bio, clean_amt
-# ==========================================
 
+# ==========================================
 # 🛡️ RATE LIMITER & STATE MANAGEMENT
 # ==========================================
 admin_data, user_states, user_qr_messages, pending_orders, all_orders_cache = {}, {}, {}, {}, {}
@@ -405,7 +402,6 @@ def clear_user_state(user_id):
         except: pass
     threading.Thread(target=_bg, daemon=True).start()
 
-# --- SEQUENTIAL PAISE COUNTER (.01 to .99) ---
 def generate_unique_amount(base_amount):
     global paise_counter
     base_clean = int(float(base_amount))
@@ -622,7 +618,8 @@ def handle_join_request(message):
     used_link = message.invite_link.invite_link if message.invite_link else ""
     
     course = None
-    for c in courses_col.find({"channel_id": chat_id}):
+    # Now searching for either single channel_id or within channel_ids array
+    for c in courses_col.find({"$or": [{"channel_id": chat_id}, {"channel_ids": chat_id}]}):
         if c.get("secret_text", "") and used_link in c.get("secret_text", ""):
             course = c
             break
@@ -707,15 +704,18 @@ def send_course_to_user(chat_id, course):
     custom_caption = course.get("custom_caption", "").strip()
     final_cap = f"{first_photo_caption}\n\n{custom_caption}" if first_photo_caption and custom_caption else (first_photo_caption or custom_caption)
 
+    sent_mids = []
     if not media_items:
         full_text = "".join(t.get("caption", "") + "\n\n" for t in text_items) + custom_caption
         if not full_text.strip(): full_text = f"📚 <b>Pack: {course.get('title', course['course_id'])}</b>\nPrice: ₹{int(final_price) if final_price.is_integer() else final_price}"
-        bot.send_message(chat_id, full_text.strip(), reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
+        msg = bot.send_message(chat_id, full_text.strip(), reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
+        sent_mids.append(msg.message_id)
     elif len(media_items) == 1:
         it = media_items[0]
         try:
-            if it["type"] == "photo": bot.send_photo(chat_id, it["file_id"], caption=final_cap, reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
-            elif it["type"] == "video": bot.send_video(chat_id, it["file_id"], caption=final_cap, reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
+            if it["type"] == "photo": msg = bot.send_photo(chat_id, it["file_id"], caption=final_cap, reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
+            elif it["type"] == "video": msg = bot.send_video(chat_id, it["file_id"], caption=final_cap, reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
+            if msg: sent_mids.append(msg.message_id)
         except Exception: pass
     else:
         media_group_html = []
@@ -725,13 +725,21 @@ def send_course_to_user(chat_id, course):
             elif item["type"] == "video": media_group_html.append(InputMediaVideo(item["file_id"], caption=cap, parse_mode="HTML"))
         try:
             sent_grp = orig_send_media_group(chat_id, media_group_html, protect_content=PROTECT_CONTENT)
-            for m in sent_grp: register_activity(chat_id, m.message_id, "course")
+            for m in sent_grp: 
+                register_activity(chat_id, m.message_id, "course")
+                sent_mids.append(m.message_id)
         except Exception: pass
-        try: bot.send_message(chat_id, "👆 <b>Choose an option to buy:</b>\n", reply_markup=markup, parse_mode="HTML", msg_type="course")
+        try: 
+            msg = bot.send_message(chat_id, "👆 <b>Choose an option to buy:</b>\n", reply_markup=markup, parse_mode="HTML", msg_type="course")
+            if msg: sent_mids.append(msg.message_id)
         except Exception: pass
 
+    schedule_course_auto_delete(chat_id, sent_mids)
+
 def send_batch_to_user(chat_id, batch):
-    bot.send_message(chat_id, f"📦 <b>{batch['title']}</b>\nAll packs are listed below:", parse_mode="HTML", msg_type="course")
+    msg = bot.send_message(chat_id, f"📦 <b>{batch['title']}</b>\nAll packs are listed below:", parse_mode="HTML", msg_type="course")
+    if msg: schedule_course_auto_delete(chat_id, [msg.message_id])
+    
     raw_cids = batch.get("course_ids", [])
     course_ids = json.loads(raw_cids) if isinstance(raw_cids, str) else raw_cids if isinstance(raw_cids, list) else []
     for cid in course_ids:
@@ -772,8 +780,9 @@ def send_admin_panel(chat_id):
     markup = InlineKeyboardMarkup()
     markup.row(InlineKeyboardButton("➕ Add Single Pack", callback_data="admin_add_course"))
     markup.row(InlineKeyboardButton("✏️ Edit Course", callback_data="admin_edit_course"))
-    markup.row(InlineKeyboardButton("🗑 Delete Pack", callback_data="admin_delete_course"))
-    markup.row(InlineKeyboardButton("📦 Pack Batch (Multi-Pack)", callback_data="admin_create_batch"))
+    markup.row(InlineKeyboardButton("🗑 Delete Pack/Batch/File", callback_data="admin_delete_course"))
+    markup.row(InlineKeyboardButton("📦 Create Batch (New Packs)", callback_data="admin_create_batch"))
+    markup.row(InlineKeyboardButton("📚 Create Batch (Existing Packs)", callback_data="admin_batch_existing"))
     markup.row(InlineKeyboardButton("🎟 Create Promo Offer", callback_data="admin_create_offer"))
     markup.row(InlineKeyboardButton("📋 Manage Store Plans", callback_data="admin_manage_plans"))
     markup.row(InlineKeyboardButton("⚡ Flash Price (Hike/Drop)", callback_data="admin_flash_price"))
@@ -866,13 +875,16 @@ def start_command(message):
                 else: markup.row(InlineKeyboardButton(b["text"], callback_data=b_url))
                 
             def _sf():
+                sent_mids = []
                 if len(m_items) == 1:
                     it = m_items[0]
                     try:
-                        if it["type"] == "text": bot.send_message(user_id, it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
-                        elif it["type"] == "photo": bot.send_photo(user_id, it["file_id"], caption=it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
-                        elif it["type"] == "video": bot.send_video(user_id, it["file_id"], caption=it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
-                        elif it["type"] == "document": bot.send_document(user_id, it["file_id"], caption=it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
+                        msg = None
+                        if it["type"] == "text": msg = bot.send_message(user_id, it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
+                        elif it["type"] == "photo": msg = bot.send_photo(user_id, it["file_id"], caption=it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
+                        elif it["type"] == "video": msg = bot.send_video(user_id, it["file_id"], caption=it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
+                        elif it["type"] == "document": msg = bot.send_document(user_id, it["file_id"], caption=it["caption"], reply_markup=markup, parse_mode="HTML", protect_content=PROTECT_CONTENT, msg_type="course")
+                        if msg: sent_mids.append(msg.message_id)
                     except Exception as e: bot.send_message(user_id, f"❌ Error: {e}", msg_type="general")
                 elif len(m_items) > 1:
                     m_group = []
@@ -882,9 +894,16 @@ def start_command(message):
                         elif it["type"] == "document": m_group.append(InputMediaDocument(it["file_id"], caption=it["caption"], parse_mode="HTML"))
                     try:
                         sent = orig_send_media_group(user_id, m_group, protect_content=PROTECT_CONTENT)
-                        for m in sent: register_activity(user_id, m.message_id, "course")
-                        if btns or any(i["type"] == "text" for i in m_items): bot.send_message(user_id, "👇", reply_markup=markup, parse_mode="HTML", msg_type="course")
+                        for m in sent: 
+                            register_activity(user_id, m.message_id, "course")
+                            sent_mids.append(m.message_id)
+                        if btns or any(i["type"] == "text" for i in m_items): 
+                            msg = bot.send_message(user_id, "👇", reply_markup=markup, parse_mode="HTML", msg_type="course")
+                            if msg: sent_mids.append(msg.message_id)
                     except Exception as e: bot.send_message(user_id, f"❌ Error: {e}", msg_type="general")
+                
+                schedule_course_auto_delete(user_id, sent_mids)
+
             threading.Thread(target=_sf, daemon=True).start()
         else: bot.send_message(user_id, "❌ <b>File not found or expired.</b>", parse_mode="HTML", msg_type="general")
     else:
@@ -931,15 +950,22 @@ def handle_all_messages(message):
 
     if user_id == ADMIN_ID and user_id in admin_data:
         step = admin_data[ADMIN_ID].get("step")
+        
         if step == "DELETE_COURSE":
             cid = message.text.strip()
             if courses_col.delete_one({"course_id": cid}).deleted_count:
                 settings_col.update_one({"_id": "store_plans"}, {"$pull": {"course_ids": cid}})
                 invalidate_cache(f"course_{cid}")
-                bot.send_message(ADMIN_ID, f"✅ <b>Course <code>{cid}</code> Deleted!</b>", parse_mode="HTML")
-            else: bot.send_message(ADMIN_ID, "❌ <b>Not found.</b>", parse_mode="HTML")
+                bot.send_message(ADMIN_ID, f"✅ <b>Pack <code>{cid}</code> Deleted!</b>", parse_mode="HTML")
+            elif batches_col.delete_one({"batch_id": cid}).deleted_count:
+                bot.send_message(ADMIN_ID, f"✅ <b>Batch <code>{cid}</code> Deleted!</b>", parse_mode="HTML")
+            elif file_links_col.delete_one({"file_code": cid}).deleted_count:
+                bot.send_message(ADMIN_ID, f"✅ <b>File Link <code>{cid}</code> Deleted!</b>", parse_mode="HTML")
+            else: 
+                bot.send_message(ADMIN_ID, "❌ <b>ID not found in Courses, Batches, or File Links.</b>", parse_mode="HTML")
             del admin_data[ADMIN_ID]
             return send_admin_panel(ADMIN_ID)
+            
         elif step == "ADD_PLAN_ID":
             cid = message.text.strip()
             if courses_col.find_one({"course_id": cid}):
@@ -949,6 +975,34 @@ def handle_all_messages(message):
             else: bot.send_message(ADMIN_ID, "❌ <b>Invalid ID.</b>", parse_mode="HTML")
             del admin_data[ADMIN_ID]
             return send_admin_panel(ADMIN_ID)
+            
+        elif step == "BATCH_EXISTING_TITLE":
+            admin_data[ADMIN_ID]["title"] = message.text.strip()
+            admin_data[ADMIN_ID]["step"] = "BATCH_EXISTING_IDS"
+            bot.send_message(ADMIN_ID, "✅ Title saved.\n\nNow send <b>Course IDs</b> one by one (e.g. <code>c_123456</code>).\nSend <code>done</code> when finished.", parse_mode="HTML")
+            return
+            
+        elif step == "BATCH_EXISTING_IDS":
+            txt = message.text.strip()
+            if txt.lower() == "done":
+                if not admin_data[ADMIN_ID].get("course_ids"):
+                    bot.send_message(ADMIN_ID, "❌ Batch is empty. Setup cancelled.")
+                    del admin_data[ADMIN_ID]
+                    return send_admin_panel(ADMIN_ID)
+                bid = "b_" + str(uuid.uuid4())[:6]
+                batches_col.update_one({"batch_id": bid}, {"$set": {"batch_id": bid, "title": admin_data[ADMIN_ID]["title"], "course_ids": admin_data[ADMIN_ID]["course_ids"]}}, upsert=True)
+                bot.send_message(ADMIN_ID, f"🎉 <b>Batch Created Successfully!</b>\n👉 <code>https://t.me/{bot.get_me().username}?start={bid}</code>", parse_mode="HTML")
+                del admin_data[ADMIN_ID]
+                return send_admin_panel(ADMIN_ID)
+            else:
+                cid = txt
+                if not courses_col.find_one({"course_id": cid}):
+                    bot.send_message(ADMIN_ID, f"❌ <b>Course ID <code>{cid}</code> not found!</b> Try again.", parse_mode="HTML")
+                else:
+                    admin_data[ADMIN_ID]["course_ids"].append(cid)
+                    bot.send_message(ADMIN_ID, f"✅ Added <code>{cid}</code>. Send next ID or type <code>done</code>.", parse_mode="HTML")
+            return
+
         elif step == "EDIT_COURSE_ID":
             cid = message.text.strip()
             course = courses_col.find_one({"course_id": cid})
@@ -1200,24 +1254,22 @@ def handle_all_messages(message):
                 chat_info = bot.get_chat(channel_id)
                 channel_name = chat_info.title if chat_info.title else "Private Channel"
                 link = bot.create_chat_invite_link(channel_id, creates_join_request=True)
-                secret_text = f"👉 <b>Click here to join the Group/Channel:</b>\n{link.invite_link}"
-                cid = "c_" + str(uuid.uuid4())[:6]
                 
-                courses_col.update_one({"course_id": cid}, {"$set": {
-                    "course_id": cid, "title": admin_data[ADMIN_ID].get("title", channel_name), "promo_media": admin_data[ADMIN_ID]["promo"], "amount": admin_data[ADMIN_ID]["amount"],
-                    "custom_caption": admin_data[ADMIN_ID].get("caption", ""), "secret_text": secret_text, "channel_id": channel_id,
-                    "channel_name": channel_name, "extra_buttons": admin_data[ADMIN_ID].get("course_buttons", [])
-                }}, upsert=True)
+                if "channels" not in admin_data[ADMIN_ID]:
+                    admin_data[ADMIN_ID]["channels"] = []
+                    
+                admin_data[ADMIN_ID]["channels"].append({
+                    "id": channel_id,
+                    "name": channel_name,
+                    "link": link.invite_link
+                })
                 
-                if admin_data[ADMIN_ID].get("mode") == "single":
-                    bot.send_message(ADMIN_ID, f"🎉 <b>Channel Pack created! ({channel_name})</b>\n👉 <code>https://t.me/{bot.get_me().username}?start={cid}</code>", parse_mode="HTML")
-                    del admin_data[ADMIN_ID]
-                    send_admin_panel(ADMIN_ID)
-                elif admin_data[ADMIN_ID].get("mode") == "batch":
-                    admin_data[ADMIN_ID]["course_ids"].append(cid)
-                    admin_data[ADMIN_ID]["step"] = "NEXT_ACTION"
-                    m = InlineKeyboardMarkup().row(InlineKeyboardButton("➕ Add Another", callback_data="batch_add_next")).row(InlineKeyboardButton("✅ Finish Batch", callback_data="batch_finish"))
-                    bot.send_message(ADMIN_ID, "✅ <b>Pack saved!</b>", reply_markup=m, parse_mode="HTML")
+                m = InlineKeyboardMarkup().row(
+                    InlineKeyboardButton("➕ Add Another Channel", callback_data="batch_add_channel")
+                ).row(
+                    InlineKeyboardButton("✅ Finish & Save Pack", callback_data="batch_finish_channel")
+                )
+                bot.send_message(ADMIN_ID, f"✅ <b>Added: {channel_name}</b>\n\nDo you want to add another channel to this pack, or finish?", reply_markup=m, parse_mode="HTML")
             except Exception as e:
                 bot.send_message(ADMIN_ID, f"❌ Error: Make sure the bot is an Admin in the Channel/Group first! ({e})")
             return
@@ -1358,7 +1410,6 @@ def handle_buttons(call):
     threading.Thread(target=bg_answer, daemon=True).start()
     register_activity(chat_id, msg_id, "general")
 
-    # --- CHANNEL FORCE ACTIONS (Approve / Cancel) ---
     if data.startswith("ch_app_"):
         oid = data.replace("ch_app_", "")
         o = all_orders_cache.get(oid) or orders_col.find_one({"order_id": oid})
@@ -1509,7 +1560,6 @@ def handle_buttons(call):
                     except: pass
                     return
 
-                # 1. तुरंत स्टेटस मैसेज भेजना
                 wait_msg = None
                 try: wait_msg = bot.send_message(chat_id, "⏳ <i>Generating your UPI QR Code... Just a moment!</i>", parse_mode="HTML", msg_type="general")
                 except Exception: pass
@@ -1534,7 +1584,6 @@ def handle_buttons(call):
                 ch_name_display = f"\n📺 <b>Channel:</b> {course.get('channel_name')}" if course.get("channel_name") else f"\n📚 <b>Pack:</b> <code>{course_id}</code>"
                 ch_txt = f"🟡 <b>[ORDER INITIATED - QR]</b>\n\n👤 <b>User:</b> {u_men}\n🔖 <b>Order:</b> <code>{order_id}</code>{ch_name_display}\n💰 <b>Amount:</b> ₹{amt_key}{d_log}\n⏳ <b>Status:</b> ⏳ Pending"
                 
-                # --- CHANNEL INLINE BUTTONS (Approve & Cancel) ---
                 ch_markup = InlineKeyboardMarkup()
                 ch_markup.row(
                     InlineKeyboardButton("✅ Force Approve", callback_data=f"ch_app_{order_id}"),
@@ -1574,7 +1623,6 @@ def handle_buttons(call):
                 user_qr_messages[chat_id] = sent_msg.message_id
                 orders_col.update_one({"order_id": order_id}, {"$set": {"qr_msg_id": sent_msg.message_id}})
                 
-                # 3. QR कोड सेंड होते ही पुराना लोडिंग मैसेज डिलीट
                 if wait_msg:
                     try: bot.delete_message(chat_id, wait_msg.message_id)
                     except Exception: pass
@@ -1702,6 +1750,7 @@ def handle_buttons(call):
         bot.edit_message_text("✅ <b>Send secret link or text:</b>", chat_id, msg_id, parse_mode="HTML")
     elif data == "ctype_channel":
         admin_data[ADMIN_ID]["step"] = "CHANNEL_ID"
+        admin_data[ADMIN_ID]["channels"] = []
         bot.edit_message_text("📢 <b>Forward a message OR send Private Channel Link:</b>", chat_id, msg_id, parse_mode="HTML")
     elif data == "skip_caption" and ADMIN_ID in admin_data:
         admin_data[ADMIN_ID]["caption"] = ""
@@ -1720,7 +1769,7 @@ def handle_buttons(call):
         bot.edit_message_text("🎯 Send Course ID (e.g. <code>c_abc123</code>):", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "admin_delete_course":
         admin_data[ADMIN_ID] = {"step": "DELETE_COURSE"}
-        bot.edit_message_text("🗑 Send Course ID to delete:", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+        bot.edit_message_text("🗑 Send <b>Course ID / Batch ID / File ID</b> to delete:", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "admin_edit_course":
         admin_data[ADMIN_ID] = {"step": "EDIT_COURSE_ID"}
         bot.edit_message_text("✏️ Send Course ID to edit:", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
@@ -1755,12 +1804,15 @@ def handle_buttons(call):
         invalidate_cache("start_menu")
         bot.edit_message_text("✅ <b>Reset!</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
         send_admin_panel(chat_id)
-    elif data == "admin_add_course":
-        admin_data[ADMIN_ID] = {"mode": "single", "step": "TITLE", "promo": [], "amount": None, "caption": "", "course_buttons": []}
-        bot.edit_message_text("📝 <b>Step 1: Send Course Title</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "admin_create_batch":
         admin_data[ADMIN_ID] = {"mode": "batch", "step": "TITLE", "course_ids": []}
         bot.edit_message_text("📦 <b>Send Batch Title:</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+    elif data == "admin_batch_existing":
+        admin_data[ADMIN_ID] = {"mode": "batch_existing", "step": "BATCH_EXISTING_TITLE", "course_ids": []}
+        bot.edit_message_text("📚 <b>Send Batch Title:</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+    elif data == "admin_add_course":
+        admin_data[ADMIN_ID] = {"mode": "single", "step": "TITLE", "promo": [], "amount": None, "caption": "", "course_buttons": []}
+        bot.edit_message_text("📝 <b>Step 1: Send Course Title</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data in ["admin_file_link", "admin_broadcast"]:
         admin_data[ADMIN_ID] = {"step": "FTL_MEDIA" if data == "admin_file_link" else "BC_MEDIA", "media": []}
         bot.edit_message_text(f"{'📎 File to Link' if data == 'admin_file_link' else '📢 Broadcast'}\nSend Media/Text.", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
@@ -1778,6 +1830,45 @@ def handle_buttons(call):
             bot.edit_message_text(f"🎉 <b>Batch Created!</b>\n👉 <code>https://t.me/{BOT_USERNAME}?start={bid}</code>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
             del admin_data[ADMIN_ID]
             send_admin_panel(chat_id)
+            
+    elif data == "batch_add_channel":
+        admin_data[ADMIN_ID]["step"] = "CHANNEL_ID"
+        bot.edit_message_text("📢 <b>Forward next message OR send next Private Channel Link:</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+        
+    elif data == "batch_finish_channel":
+        channels = admin_data.get(ADMIN_ID, {}).get("channels", [])
+        if not channels: return bot.edit_message_text("❌ No channels added.", chat_id=chat_id, message_id=msg_id)
+
+        cid = "c_" + str(uuid.uuid4())[:6]
+        secret_text = "👉 <b>Click below to join the Group(s)/Channel(s):</b>\n\n"
+        channel_ids = []
+        channel_names = []
+        
+        for ch in channels:
+            secret_text += f"🔹 {ch['name']}:\n{ch['link']}\n\n"
+            channel_ids.append(ch['id'])
+            channel_names.append(ch['name'])
+
+        combined_name = " + ".join(channel_names)
+
+        courses_col.update_one({"course_id": cid}, {"$set": {
+            "course_id": cid, "title": admin_data[ADMIN_ID].get("title", combined_name),
+            "promo_media": admin_data[ADMIN_ID]["promo"], "amount": admin_data[ADMIN_ID]["amount"],
+            "custom_caption": admin_data[ADMIN_ID].get("caption", ""), "secret_text": secret_text,
+            "channel_ids": channel_ids, "channel_name": combined_name,
+            "extra_buttons": admin_data[ADMIN_ID].get("course_buttons", [])
+        }}, upsert=True)
+
+        if admin_data[ADMIN_ID].get("mode") == "single":
+            bot.edit_message_text(f"🎉 <b>Channel Pack created! ({combined_name})</b>\n👉 <code>https://t.me/{bot.get_me().username}?start={cid}</code>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+            del admin_data[ADMIN_ID]
+            send_admin_panel(ADMIN_ID)
+        elif admin_data[ADMIN_ID].get("mode") == "batch":
+            admin_data[ADMIN_ID]["course_ids"].append(cid)
+            admin_data[ADMIN_ID]["step"] = "NEXT_ACTION"
+            m = InlineKeyboardMarkup().row(InlineKeyboardButton("➕ Add Another", callback_data="batch_add_next")).row(InlineKeyboardButton("✅ Finish Batch", callback_data="batch_finish"))
+            bot.edit_message_text("✅ <b>Pack saved to batch!</b>", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
+            
     elif data == "admin_user_info":
         recs = list(purchases_col.find().sort("_id", -1).limit(15))
         txt = "👥 <b>Recent Purchases:</b>\n\n" + "".join(f"👤 {r.get('username')} | 📅 {r.get('date', '')[:10]} | 📚 <code>{r.get('item_info')}</code>\n" for r in recs) if recs else "No purchases yet."
@@ -1954,7 +2045,7 @@ def api_inject_sms():
 def api_courses():
     out = []
     for c in courses_col.find().sort("_id", -1):
-        out.append({"course_id": c.get("course_id"), "title": c.get("title", ""), "amount": c.get("amount"), "caption": c.get("custom_caption", "")[:40], "is_channel": bool(c.get("channel_id"))})
+        out.append({"course_id": c.get("course_id"), "title": c.get("title", ""), "amount": c.get("amount"), "caption": c.get("custom_caption", "")[:40], "is_channel": bool(c.get("channel_id") or c.get("channel_ids"))})
     return jsonify(out)
 
 @app.route("/dashboard/api/courses/<course_id>", methods=["DELETE"])
@@ -1970,7 +2061,7 @@ def api_delete_course(course_id):
 @require_auth
 def api_course_buyers(course_id):
     course = get_cached_course(course_id)
-    is_channel = bool(course and course.get("channel_id"))
+    is_channel = bool(course and (course.get("channel_id") or course.get("channel_ids")))
     completed_q = {"course_id": course_id, "status": {"$in": ["COMPLETED_AUTO", "COMPLETED_MANUAL"]}}
     out = []
     for o in orders_col.find(completed_q).sort("delivered_at_ts", -1):
@@ -2033,6 +2124,7 @@ def api_system_settings():
             "auto_del_promos": data.get("auto_del_promos", True),
             "auto_del_broadcasts": data.get("auto_del_broadcasts", True),
             "auto_del_purchases": data.get("auto_del_purchases", False),
+            "course_timer_minutes": int(data.get("course_timer_minutes", 0)),
             "updated_at": get_ist_time()
         }
         settings_col.update_one({"_id": "system_settings"}, {"$set": doc}, upsert=True)
@@ -2058,7 +2150,8 @@ def api_system_settings():
         "cleanup_seconds": int(cfg.get("cleanup_seconds", 86400)),
         "auto_del_promos": cfg.get("auto_del_promos", True),
         "auto_del_broadcasts": cfg.get("auto_del_broadcasts", True),
-        "auto_del_purchases": cfg.get("auto_del_purchases", False)
+        "auto_del_purchases": cfg.get("auto_del_purchases", False),
+        "course_timer_minutes": int(cfg.get("course_timer_minutes", 0))
     })
 
 @app.route("/dashboard/api/force-clear-chats", methods=["POST"])
@@ -2276,9 +2369,22 @@ async function load(){
             <span class="slider"></span>
           </label>
         </div>
+        
         <hr style="border-color:var(--line); margin: 20px 0;">
-        <h3>🧹 Auto Chat-Delete Settings</h3>
-        <label>Auto-Clear Timer:</label>
+        <h3>⏱️ Content Auto-Delete Timer</h3>
+        <p style="font-size:12px; color:var(--muted)">जब भी यूज़र किसी कोर्स, बैच या फाइल लिंक पर क्लिक करेगा, तो जो कंटेंट उसे शो होगा, वह इतने टाइम के बाद अपने आप डिलीट हो जाएगा।</p>
+        <label>Course/File Auto-Delete Timer:</label>
+        <select id="course_timer_minutes" onchange="saveSettings()">
+            <option value="0" ${cfg.course_timer_minutes==0?'selected':''}>Disabled (Off)</option>
+            <option value="5" ${cfg.course_timer_minutes==5?'selected':''}>5 Minutes</option>
+            <option value="10" ${cfg.course_timer_minutes==10?'selected':''}>10 Minutes</option>
+            <option value="20" ${cfg.course_timer_minutes==20?'selected':''}>20 Minutes</option>
+            <option value="30" ${cfg.course_timer_minutes==30?'selected':''}>30 Minutes</option>
+        </select>
+
+        <hr style="border-color:var(--line); margin: 20px 0;">
+        <h3>🧹 General Auto Chat-Delete (Inactivity)</h3>
+        <label>Auto-Clear Inactive Chat Timer:</label>
         <select id="cleanup_time" onchange="saveSettings()">
             <option value="0" ${cfg.cleanup_seconds==0?'selected':''}>Disabled (Off)</option>
             <option value="3600" ${cfg.cleanup_seconds==3600?'selected':''}>1 Hour</option>
@@ -2286,9 +2392,10 @@ async function load(){
             <option value="86400" ${cfg.cleanup_seconds==86400?'selected':''}>24 Hours</option>
             <option value="172800" ${cfg.cleanup_seconds==172800?'selected':''}>48 Hours</option>
         </select>
-        <label class="checkbox-lbl"><input type="checkbox" id="auto_del_promos" ${cfg.auto_del_promos?'checked':''} onchange="saveSettings()"> 🗑️ Auto-Delete Promos, Menus & Courses</label>
+        <label class="checkbox-lbl"><input type="checkbox" id="auto_del_promos" ${cfg.auto_del_promos?'checked':''} onchange="saveSettings()"> 🗑️ Auto-Delete Promos, Menus</label>
         <label class="checkbox-lbl"><input type="checkbox" id="auto_del_broadcasts" ${cfg.auto_del_broadcasts?'checked':''} onchange="saveSettings()"> 🗑️ Auto-Delete Broadcast Messages</label>
         <label class="checkbox-lbl"><input type="checkbox" id="auto_del_purchases" ${cfg.auto_del_purchases?'checked':''} onchange="saveSettings()"> <span style="color:var(--danger)">⚠️ Auto-Delete Purchased Links</span></label>
+        
         <hr style="border-color:var(--line); margin: 20px 0;">
         <button style="background-color:var(--danger);" onclick="forceClearChats()">🧹 Clear Selected Chats Now</button>
       </div>
@@ -2345,7 +2452,8 @@ async function saveSettings(){
       cleanup_seconds: document.getElementById("cleanup_time").value,
       auto_del_promos: document.getElementById("auto_del_promos").checked,
       auto_del_broadcasts: document.getElementById("auto_del_broadcasts").checked,
-      auto_del_purchases: document.getElementById("auto_del_purchases").checked
+      auto_del_purchases: document.getElementById("auto_del_purchases").checked,
+      course_timer_minutes: document.getElementById("course_timer_minutes").value
     })
   });
 }
