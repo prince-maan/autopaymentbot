@@ -1,4 +1,5 @@
 import gc
+import hmac
 import io
 import json
 import os
@@ -51,7 +52,10 @@ SMS_POOL_TTL_HOURS = int(os.environ.get("SMS_POOL_TTL_HOURS", "5"))
 ORDER_TTL_HOURS = int(os.environ.get("ORDER_TTL_HOURS", "48"))
 
 DASHBOARD_USERNAME = os.environ.get("DASHBOARD_USERNAME", "admin")
-DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "changeme123")
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
+if not DASHBOARD_PASSWORD or DASHBOARD_PASSWORD == "changeme123":
+    print("❌ ERROR: DASHBOARD_PASSWORD सेट करें (default/कमज़ोर पासवर्ड allowed नहीं है)।")
+    sys.exit(1)
 
 try:
     ADMIN_ID = int(os.environ.get("ADMIN_ID"))
@@ -71,6 +75,39 @@ def get_ist_time():
     return datetime.now(IST).strftime("%d-%m-%Y %I:%M:%S %p")
 
 # ==========================================
+# 👑 MULTI-ADMIN HELPERS
+# ==========================================
+# ENV वाला ADMIN_ID = Owner (हमेशा admin, डिलीट नहीं हो सकता)
+# बाकी admins MongoDB की "admins" collection में रहते हैं, जो Dashboard से add/remove होते हैं।
+_admin_cache = {"ids": set(), "ts": 0.0}
+_admin_lock = threading.Lock()
+
+def get_admin_ids():
+    now = time.time()
+    with _admin_lock:
+        if now - _admin_cache["ts"] < 10:
+            return set(_admin_cache["ids"])
+    ids = set()
+    try:
+        for d in admins_col.find({}, {"user_id": 1}):
+            try: ids.add(int(d["user_id"]))
+            except (TypeError, ValueError): pass
+    except Exception:
+        pass
+    with _admin_lock:
+        _admin_cache["ids"], _admin_cache["ts"] = ids, now
+    return set(ids)
+
+def refresh_admin_cache():
+    with _admin_lock:
+        _admin_cache["ts"] = 0.0
+
+def is_admin(uid):
+    if uid is None: return False
+    if uid == ADMIN_ID: return True
+    return uid in get_admin_ids()
+
+# ==========================================
 # 🍃 MONGODB SETUP
 # ==========================================
 try:
@@ -86,12 +123,19 @@ try:
     sms_pool_col = db["sms_pool"]
     offers_col = db["offers"]
     channel_logs_col = db["channel_logs"]
+    admins_col = db["admins"]  # Dashboard से जोड़े गए extra admins
+    broadcasts_col = db["broadcasts"]  # Dashboard से भेजे गए broadcasts का रिकॉर्ड (हटाने के लिए)
 
     try:
         sms_pool_col.create_index("created_at_dt", expireAfterSeconds=SMS_POOL_TTL_HOURS * 3600)
         orders_col.create_index("created_at_dt", expireAfterSeconds=ORDER_TTL_HOURS * 3600)
         orders_col.create_index([("user_id", 1), ("offer_id", 1), ("status", 1)])
         orders_col.create_index([("course_id", 1), ("status", 1)])
+        orders_col.create_index([("created_at", -1)])
+        orders_col.create_index([("status", 1), ("delivered_at_ts", -1)])
+        purchases_col.create_index("user_id")
+        users_col.create_index("user_id")
+        broadcasts_col.create_index("bid")
     except Exception:
         pass
     print(f"✅ MongoDB Connected! (Database: {MONGO_DB_NAME})")
@@ -221,7 +265,7 @@ def clear_inactive_chat(chat_id, is_force=False, force_del_promos=True, force_de
         except Exception: pass
 
 def register_activity(chat_id, message_id=None, msg_type="general"):
-    if not isinstance(chat_id, int) or chat_id <= 0 or chat_id == ADMIN_ID: return
+    if not isinstance(chat_id, int) or chat_id <= 0 or is_admin(chat_id): return
     with tracker_lock:
         if chat_id not in user_chat_messages: user_chat_messages[chat_id] = []
         if message_id:
@@ -628,7 +672,7 @@ def handle_join_request(message):
         
     course_id = course["course_id"]
     channel_name = course.get("channel_name") or message.chat.title or "Private Channel/Group"
-    purchase = purchases_col.find_one({"user_id": user_id, "item_info": {"$regex": course_id}})
+    purchase = purchases_col.find_one({"user_id": user_id, "item_info": {"$regex": re.escape(course_id)}})
     now_str = get_ist_time()
     
     u_first_name = message.from_user.first_name
@@ -776,33 +820,70 @@ def send_custom_start_menu(chat_id):
         default_text = f"👋 <b>Welcome to our Store!</b>\n\nSelect an option below to get started:\n\n📊 <b>Your Stats:</b>\n🛒 Total Courses Bought: <b>{len(total_purchases)}</b>\n🎁 Offers Status: <b>{offer_status}</b>"
         bot.send_message(chat_id, default_text, reply_markup=markup, parse_mode="HTML", msg_type="menu")
 
+# ---- Admin panel: categories -> sub-menus (सभी callbacks वही हैं, बस व्यवस्थित) ----
+ADMIN_CATEGORIES = {
+    "packs": ("📦 Packs & Batches", [
+        ("➕ Add Single Pack", "admin_add_course"),
+        ("✏️ Edit Course", "admin_edit_course"),
+        ("🗑 Delete Pack/Batch/File", "admin_delete_course"),
+        ("📦 Create Batch (New Packs)", "admin_create_batch"),
+        ("📚 Create Batch (Existing Packs)", "admin_batch_existing"),
+        ("📋 Manage Store Plans", "admin_manage_plans"),
+    ]),
+    "offers": ("🎟 Offers & Pricing", [
+        ("🎟 Create Promo Offer", "admin_create_offer"),
+        ("⚡ Flash Price (Hike/Drop)", "admin_flash_price"),
+    ]),
+    "menus": ("🎨 Menus & Buttons", [
+        ("🎨 Customize Start Menu", "admin_custom_menu"),
+        ("🌍 Custom International Button", "admin_custom_intl"),
+        ("🔘 Global Course Buttons", "admin_global_cbtns"),
+    ]),
+    "delivery": ("🎉 Delivery & Files", [
+        ("🎉 Post-Purchase Setup", "admin_success_msg"),
+        ("🔗 Advanced File to Link", "admin_file_link"),
+    ]),
+    "broadcast": ("📢 Broadcast & Users", [
+        ("📢 Advanced Broadcast", "admin_broadcast"),
+        ("👥 User Info", "admin_user_info"),
+    ]),
+}
+ADMIN_HOME_TEXT = "🛠 <b>Admin Panel</b>\nनीचे से कैटेगरी चुनें 👇"
+
+def admin_home_markup():
+    m = InlineKeyboardMarkup()
+    for key, (title, _) in ADMIN_CATEGORIES.items():
+        m.row(InlineKeyboardButton(title, callback_data=f"admin_cat_{key}"))
+    return m
+
 def send_admin_panel(chat_id):
-    markup = InlineKeyboardMarkup()
-    markup.row(InlineKeyboardButton("➕ Add Single Pack", callback_data="admin_add_course"))
-    markup.row(InlineKeyboardButton("✏️ Edit Course", callback_data="admin_edit_course"))
-    markup.row(InlineKeyboardButton("🗑 Delete Pack/Batch/File", callback_data="admin_delete_course"))
-    markup.row(InlineKeyboardButton("📦 Create Batch (New Packs)", callback_data="admin_create_batch"))
-    markup.row(InlineKeyboardButton("📚 Create Batch (Existing Packs)", callback_data="admin_batch_existing"))
-    markup.row(InlineKeyboardButton("🎟 Create Promo Offer", callback_data="admin_create_offer"))
-    markup.row(InlineKeyboardButton("📋 Manage Store Plans", callback_data="admin_manage_plans"))
-    markup.row(InlineKeyboardButton("⚡ Flash Price (Hike/Drop)", callback_data="admin_flash_price"))
-    markup.row(InlineKeyboardButton("🎨 Customize Start Menu", callback_data="admin_custom_menu"))
-    markup.row(InlineKeyboardButton("🌍 Custom International Button", callback_data="admin_custom_intl"))
-    markup.row(InlineKeyboardButton("🔘 Global Course Buttons", callback_data="admin_global_cbtns"))
-    markup.row(InlineKeyboardButton("🎉 Post-Purchase Setup", callback_data="admin_success_msg"))
-    markup.row(InlineKeyboardButton("🔗 Advanced File to Link", callback_data="admin_file_link"))
-    markup.row(InlineKeyboardButton("📢 Advanced Broadcast", callback_data="admin_broadcast"))
-    markup.row(InlineKeyboardButton("👥 User Info", callback_data="admin_user_info"))
-    bot.send_message(chat_id, "🛠 <b>Admin Panel</b>\nPlease select an option:\n", reply_markup=markup, parse_mode="HTML")
+    bot.send_message(chat_id, ADMIN_HOME_TEXT, reply_markup=admin_home_markup(), parse_mode="HTML")
+
+def show_admin_category(chat_id, msg_id, key):
+    title, items = ADMIN_CATEGORIES[key]
+    m = InlineKeyboardMarkup()
+    for label, cb in items:
+        m.row(InlineKeyboardButton(label, callback_data=cb))
+    m.row(InlineKeyboardButton("🔙 Back", callback_data="admin_home"))
+    bot.edit_message_text(f"<b>{title}</b>\nपसंद का ऑप्शन चुनें:", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
+
 
 # ==========================================
 # COMMANDS & HANDLERS
 # ==========================================
+@bot.message_handler(commands=["cancel"])
+def cancel_command(message):
+    """किसी भी चल रहे step/flow को रोकने के लिए (user + admin दोनों)"""
+    uid = message.chat.id
+    clear_user_state(uid)
+    admin_data.pop(uid, None)
+    bot.send_message(uid, "❌ <b>Cancelled.</b>\nकोई भी चल रहा process रोक दिया गया है। /start भेजें।", parse_mode="HTML", msg_type="general")
+
 @bot.message_handler(commands=["start"])
 def start_command(message):
     user_id = message.chat.id
     
-    if is_maintenance_mode() and user_id != ADMIN_ID:
+    if is_maintenance_mode() and not is_admin(user_id):
         orig_send_message(user_id, "⚠️ <b>Bot is currently under maintenance.</b>\nServers are busy or undergoing updates. Please try again after some time.", parse_mode="HTML")
         return
 
@@ -907,13 +988,14 @@ def start_command(message):
             threading.Thread(target=_sf, daemon=True).start()
         else: bot.send_message(user_id, "❌ <b>File not found or expired.</b>", parse_mode="HTML", msg_type="general")
     else:
-        if user_id == ADMIN_ID: send_admin_panel(user_id)
+        if is_admin(user_id): send_admin_panel(user_id)
         else: send_custom_start_menu(user_id)
 
 @bot.message_handler(content_types=["photo", "video", "document", "text"])
 def handle_all_messages(message):
     user_id = message.chat.id
-    if is_maintenance_mode() and user_id != ADMIN_ID:
+    chat_id = user_id  # private chat में chat_id == admin/user id (admin flows इसी key से चलते हैं)
+    if is_maintenance_mode() and not is_admin(user_id):
         orig_send_message(user_id, "⚠ <b>Bot is currently under maintenance.</b>\nServers are busy or undergoing updates. Please try again after some time.", parse_mode="HTML")
         return
     if not check_rate_limit(user_id, 1): return
@@ -948,110 +1030,110 @@ def handle_all_messages(message):
         except Exception as e: orig_send_message(ADMIN_ID, f"❌ Channel error: {e}")
         return
 
-    if user_id == ADMIN_ID and user_id in admin_data:
-        step = admin_data[ADMIN_ID].get("step")
+    if is_admin(user_id) and user_id in admin_data:
+        step = admin_data[user_id].get("step")
         
         if step == "DELETE_COURSE":
             cid = message.text.strip()
             if courses_col.delete_one({"course_id": cid}).deleted_count:
                 settings_col.update_one({"_id": "store_plans"}, {"$pull": {"course_ids": cid}})
                 invalidate_cache(f"course_{cid}")
-                bot.send_message(ADMIN_ID, f"✅ <b>Pack <code>{cid}</code> Deleted!</b>", parse_mode="HTML")
+                bot.send_message(chat_id,f"✅ <b>Pack <code>{cid}</code> Deleted!</b>", parse_mode="HTML")
             elif batches_col.delete_one({"batch_id": cid}).deleted_count:
-                bot.send_message(ADMIN_ID, f"✅ <b>Batch <code>{cid}</code> Deleted!</b>", parse_mode="HTML")
+                bot.send_message(chat_id,f"✅ <b>Batch <code>{cid}</code> Deleted!</b>", parse_mode="HTML")
             elif file_links_col.delete_one({"file_code": cid}).deleted_count:
-                bot.send_message(ADMIN_ID, f"✅ <b>File Link <code>{cid}</code> Deleted!</b>", parse_mode="HTML")
+                bot.send_message(chat_id,f"✅ <b>File Link <code>{cid}</code> Deleted!</b>", parse_mode="HTML")
             else: 
-                bot.send_message(ADMIN_ID, "❌ <b>ID not found in Courses, Batches, or File Links.</b>", parse_mode="HTML")
-            del admin_data[ADMIN_ID]
-            return send_admin_panel(ADMIN_ID)
+                bot.send_message(chat_id,"❌ <b>ID not found in Courses, Batches, or File Links.</b>", parse_mode="HTML")
+            del admin_data[chat_id]
+            return send_admin_panel(chat_id)
             
         elif step == "ADD_PLAN_ID":
             cid = message.text.strip()
             if courses_col.find_one({"course_id": cid}):
                 settings_col.update_one({"_id": "store_plans"}, {"$addToSet": {"course_ids": cid}}, upsert=True)
                 invalidate_cache("store_plans")
-                bot.send_message(ADMIN_ID, f"✅ <b>Course <code>{cid}</code> added to Store Plans!</b>", parse_mode="HTML")
-            else: bot.send_message(ADMIN_ID, "❌ <b>Invalid ID.</b>", parse_mode="HTML")
-            del admin_data[ADMIN_ID]
-            return send_admin_panel(ADMIN_ID)
+                bot.send_message(chat_id,f"✅ <b>Course <code>{cid}</code> added to Store Plans!</b>", parse_mode="HTML")
+            else: bot.send_message(chat_id,"❌ <b>Invalid ID.</b>", parse_mode="HTML")
+            del admin_data[chat_id]
+            return send_admin_panel(chat_id)
             
         elif step == "BATCH_EXISTING_TITLE":
-            admin_data[ADMIN_ID]["title"] = message.text.strip()
-            admin_data[ADMIN_ID]["step"] = "BATCH_EXISTING_IDS"
-            bot.send_message(ADMIN_ID, "✅ Title saved.\n\nNow send <b>Course IDs</b> one by one (e.g. <code>c_123456</code>).\nSend <code>done</code> when finished.", parse_mode="HTML")
+            admin_data[chat_id]["title"] = message.text.strip()
+            admin_data[chat_id]["step"] = "BATCH_EXISTING_IDS"
+            bot.send_message(chat_id,"✅ Title saved.\n\nNow send <b>Course IDs</b> one by one (e.g. <code>c_123456</code>).\nSend <code>done</code> when finished.", parse_mode="HTML")
             return
             
         elif step == "BATCH_EXISTING_IDS":
             txt = message.text.strip()
             if txt.lower() == "done":
-                if not admin_data[ADMIN_ID].get("course_ids"):
-                    bot.send_message(ADMIN_ID, "❌ Batch is empty. Setup cancelled.")
-                    del admin_data[ADMIN_ID]
-                    return send_admin_panel(ADMIN_ID)
+                if not admin_data[chat_id].get("course_ids"):
+                    bot.send_message(chat_id,"❌ Batch is empty. Setup cancelled.")
+                    del admin_data[chat_id]
+                    return send_admin_panel(chat_id)
                 bid = "b_" + str(uuid.uuid4())[:6]
-                batches_col.update_one({"batch_id": bid}, {"$set": {"batch_id": bid, "title": admin_data[ADMIN_ID]["title"], "course_ids": admin_data[ADMIN_ID]["course_ids"]}}, upsert=True)
-                bot.send_message(ADMIN_ID, f"🎉 <b>Batch Created Successfully!</b>\n👉 <code>https://t.me/{bot.get_me().username}?start={bid}</code>", parse_mode="HTML")
-                del admin_data[ADMIN_ID]
-                return send_admin_panel(ADMIN_ID)
+                batches_col.update_one({"batch_id": bid}, {"$set": {"batch_id": bid, "title": admin_data[chat_id]["title"], "course_ids": admin_data[chat_id]["course_ids"]}}, upsert=True)
+                bot.send_message(chat_id,f"🎉 <b>Batch Created Successfully!</b>\n👉 <code>https://t.me/{bot.get_me().username}?start={bid}</code>", parse_mode="HTML")
+                del admin_data[chat_id]
+                return send_admin_panel(chat_id)
             else:
                 cid = txt
                 if not courses_col.find_one({"course_id": cid}):
-                    bot.send_message(ADMIN_ID, f"❌ <b>Course ID <code>{cid}</code> not found!</b> Try again.", parse_mode="HTML")
+                    bot.send_message(chat_id,f"❌ <b>Course ID <code>{cid}</code> not found!</b> Try again.", parse_mode="HTML")
                 else:
-                    admin_data[ADMIN_ID]["course_ids"].append(cid)
-                    bot.send_message(ADMIN_ID, f"✅ Added <code>{cid}</code>. Send next ID or type <code>done</code>.", parse_mode="HTML")
+                    admin_data[chat_id]["course_ids"].append(cid)
+                    bot.send_message(chat_id,f"✅ Added <code>{cid}</code>. Send next ID or type <code>done</code>.", parse_mode="HTML")
             return
 
         elif step == "EDIT_COURSE_ID":
             cid = message.text.strip()
             course = courses_col.find_one({"course_id": cid})
             if not course:
-                bot.send_message(ADMIN_ID, "❌ Course ID not found. Send correct ID:")
+                bot.send_message(chat_id,"❌ Course ID not found. Send correct ID:")
                 return
-            admin_data[ADMIN_ID]["course_id"] = cid
-            admin_data[ADMIN_ID]["step"] = "EDIT_COURSE_TEXT"
-            bot.send_message(ADMIN_ID, f"✅ Found course: <b>{course.get('title', cid)}</b>\n\nSend new <b>Text/Description</b> (or type <code>skip</code> to keep old):", parse_mode="HTML")
+            admin_data[chat_id]["course_id"] = cid
+            admin_data[chat_id]["step"] = "EDIT_COURSE_TEXT"
+            bot.send_message(chat_id,f"✅ Found course: <b>{course.get('title', cid)}</b>\n\nSend new <b>Text/Description</b> (or type <code>skip</code> to keep old):", parse_mode="HTML")
             return
         elif step == "EDIT_COURSE_TEXT":
             txt = get_formatted_text(message)
             if txt.lower() != "skip":
-                courses_col.update_one({"course_id": admin_data[ADMIN_ID]["course_id"]}, {"$set": {"custom_caption": txt}})
-            admin_data[ADMIN_ID]["step"] = "EDIT_COURSE_PHOTO"
-            bot.send_message(ADMIN_ID, "✅ Text updated!\n\nNow send new <b>Photo</b> (or type <code>skip</code> if photo change nahi karni):", parse_mode="HTML")
+                courses_col.update_one({"course_id": admin_data[chat_id]["course_id"]}, {"$set": {"custom_caption": txt}})
+            admin_data[chat_id]["step"] = "EDIT_COURSE_PHOTO"
+            bot.send_message(chat_id,"✅ Text updated!\n\nNow send new <b>Photo</b> (or type <code>skip</code> if photo change nahi karni):", parse_mode="HTML")
             return
         elif step == "EDIT_COURSE_PHOTO":
-            cid = admin_data[ADMIN_ID]["course_id"]
+            cid = admin_data[chat_id]["course_id"]
             if message.photo:
                 photo_id = message.photo[-1].file_id
                 promo_data = [{"type": "photo", "file_id": photo_id, "caption": ""}]
                 courses_col.update_one({"course_id": cid}, {"$set": {"promo_media": promo_data}})
-            bot.send_message(ADMIN_ID, f"🎉 <b>Course <code>{cid}</code> successfully updated!</b>", parse_mode="HTML")
-            del admin_data[ADMIN_ID]
-            return send_admin_panel(ADMIN_ID)
+            bot.send_message(chat_id,f"🎉 <b>Course <code>{cid}</code> successfully updated!</b>", parse_mode="HTML")
+            del admin_data[chat_id]
+            return send_admin_panel(chat_id)
         elif step == "FLASH_PCT":
             try:
                 pct = float(re.sub(r"[^\d.]", "", message.text.strip()))
-                admin_data[ADMIN_ID]["percent"] = pct
-                admin_data[ADMIN_ID]["step"] = "FLASH_TARGET"
+                admin_data[chat_id]["percent"] = pct
+                admin_data[chat_id]["step"] = "FLASH_TARGET"
                 m = InlineKeyboardMarkup().row(InlineKeyboardButton("🌐 All Courses", callback_data="flash_tgt_all")).row(InlineKeyboardButton("🎯 Single Course", callback_data="flash_tgt_single"))
-                bot.send_message(ADMIN_ID, f"✅ <b>{pct}% Set!</b>\nApply to:", reply_markup=m, parse_mode="HTML")
-            except Exception: bot.send_message(ADMIN_ID, "❌ Numbers only.")
+                bot.send_message(chat_id,f"✅ <b>{pct}% Set!</b>\nApply to:", reply_markup=m, parse_mode="HTML")
+            except Exception: bot.send_message(chat_id,"❌ Numbers only.")
             return
         elif step == "FLASH_CID":
             cid = message.text.strip()
-            if not courses_col.find_one({"course_id": cid}): return bot.send_message(ADMIN_ID, "❌ Course ID not found.")
-            admin_data[ADMIN_ID]["course_id"] = cid
-            admin_data[ADMIN_ID]["step"] = "FLASH_HOURS"
-            bot.send_message(ADMIN_ID, "⏳ <b>Active for how many hours?</b> (e.g., 24)", parse_mode="HTML")
+            if not courses_col.find_one({"course_id": cid}): return bot.send_message(chat_id,"❌ Course ID not found.")
+            admin_data[chat_id]["course_id"] = cid
+            admin_data[chat_id]["step"] = "FLASH_HOURS"
+            bot.send_message(chat_id,"⏳ <b>Active for how many hours?</b> (e.g., 24)", parse_mode="HTML")
             return
         elif step == "FLASH_HOURS":
             try:
                 hrs = float(re.sub(r"[^\d.]", "", message.text.strip()))
-                admin_data[ADMIN_ID]["hours"] = hrs
-                admin_data[ADMIN_ID]["step"] = "FLASH_LIMIT"
-                bot.send_message(ADMIN_ID, "🔁 <b>How many times can a user buy at this new price?</b>\n(1 = Once per user, 0 = Unlimited):", parse_mode="HTML")
-            except Exception: bot.send_message(ADMIN_ID, "❌ Invalid hours.")
+                admin_data[chat_id]["hours"] = hrs
+                admin_data[chat_id]["step"] = "FLASH_LIMIT"
+                bot.send_message(chat_id,"🔁 <b>How many times can a user buy at this new price?</b>\n(1 = Once per user, 0 = Unlimited):", parse_mode="HTML")
+            except Exception: bot.send_message(chat_id,"❌ Invalid hours.")
             return
         elif step == "FLASH_LIMIT":
             try:
@@ -1059,184 +1141,184 @@ def handle_all_messages(message):
                 sale_id = "fs_" + str(uuid.uuid4())[:6]
                 now_ts = time.time()
                 doc = {
-                    "_id": "flash_sale", "sale_id": sale_id, "mode": admin_data[ADMIN_ID]["flash_mode"],
-                    "percent": admin_data[ADMIN_ID]["percent"], "target": admin_data[ADMIN_ID]["target"],
-                    "course_id": admin_data[ADMIN_ID].get("course_id"), "hours": admin_data[ADMIN_ID]["hours"],
-                    "limit": lim, "created_at_ts": now_ts, "expires_at_ts": now_ts + (admin_data[ADMIN_ID]["hours"] * 3600)
+                    "_id": "flash_sale", "sale_id": sale_id, "mode": admin_data[chat_id]["flash_mode"],
+                    "percent": admin_data[chat_id]["percent"], "target": admin_data[chat_id]["target"],
+                    "course_id": admin_data[chat_id].get("course_id"), "hours": admin_data[chat_id]["hours"],
+                    "limit": lim, "created_at_ts": now_ts, "expires_at_ts": now_ts + (admin_data[chat_id]["hours"] * 3600)
                 }
                 settings_col.update_one({"_id": "flash_sale"}, {"$set": doc}, upsert=True)
                 invalidate_cache("flash_sale")
-                bot.send_message(ADMIN_ID, "🎉 <b>Flash Price Applied Successfully!</b>", parse_mode="HTML")
-                del admin_data[ADMIN_ID]
-                send_admin_panel(ADMIN_ID)
-            except Exception: bot.send_message(ADMIN_ID, "❌ Invalid limit.")
+                bot.send_message(chat_id,"🎉 <b>Flash Price Applied Successfully!</b>", parse_mode="HTML")
+                del admin_data[chat_id]
+                send_admin_panel(chat_id)
+            except Exception: bot.send_message(chat_id,"❌ Invalid limit.")
             return
         elif step == "OFFER_DISCOUNT":
             try:
                 disc = int(re.sub(r"[^\d]", "", message.text.strip()))
                 if not (1 <= disc <= 100): raise ValueError()
-                admin_data[ADMIN_ID]["discount"], admin_data[ADMIN_ID]["step"] = disc, "OFFER_TARGET"
+                admin_data[chat_id]["discount"], admin_data[chat_id]["step"] = disc, "OFFER_TARGET"
                 m = InlineKeyboardMarkup().row(InlineKeyboardButton("🌐 All Courses", callback_data="offtarget_all")).row(InlineKeyboardButton("🎯 Single Course", callback_data="offtarget_single"))
-                bot.send_message(ADMIN_ID, f"✅ Discount <b>{disc}%</b> set!\nApply to:", reply_markup=m, parse_mode="HTML")
-            except Exception: bot.send_message(ADMIN_ID, "❌ 1 to 100 only.")
+                bot.send_message(chat_id,f"✅ Discount <b>{disc}%</b> set!\nApply to:", reply_markup=m, parse_mode="HTML")
+            except Exception: bot.send_message(chat_id,"❌ 1 to 100 only.")
             return
         elif step == "OFFER_SINGLE_CID":
             cid = message.text.strip()
-            if not courses_col.find_one({"course_id": cid}): return bot.send_message(ADMIN_ID, "❌ <b>Course ID not found. Send correct ID:</b>", parse_mode="HTML")
-            admin_data[ADMIN_ID]["target_course_id"], admin_data[ADMIN_ID]["step"] = cid, "OFFER_LIMIT"
-            bot.send_message(ADMIN_ID, "👥 <b>Max users?</b> (0 for unlimited):", parse_mode="HTML")
+            if not courses_col.find_one({"course_id": cid}): return bot.send_message(chat_id,"❌ <b>Course ID not found. Send correct ID:</b>", parse_mode="HTML")
+            admin_data[chat_id]["target_course_id"], admin_data[chat_id]["step"] = cid, "OFFER_LIMIT"
+            bot.send_message(chat_id,"👥 <b>Max users?</b> (0 for unlimited):", parse_mode="HTML")
             return
         elif step == "OFFER_LIMIT":
             try:
                 lim = int(re.sub(r"[^\d]", "", message.text.strip()))
-                admin_data[ADMIN_ID]["max_users"], admin_data[ADMIN_ID]["step"] = -1 if lim == 0 else lim, "OFFER_PERUSER"
-                bot.send_message(ADMIN_ID, "🔁 <b>How many times can a user claim this offer?</b>\n(<b>1</b> = just once per user. <b>0</b> = unlimited):", parse_mode="HTML")
-            except Exception: bot.send_message(ADMIN_ID, "❌ Invalid number.")
+                admin_data[chat_id]["max_users"], admin_data[chat_id]["step"] = -1 if lim == 0 else lim, "OFFER_PERUSER"
+                bot.send_message(chat_id,"🔁 <b>How many times can a user claim this offer?</b>\n(<b>1</b> = just once per user. <b>0</b> = unlimited):", parse_mode="HTML")
+            except Exception: bot.send_message(chat_id,"❌ Invalid number.")
             return
         elif step == "OFFER_PERUSER":
             try:
                 pl = int(re.sub(r"[^\d]", "", message.text.strip()))
-                admin_data[ADMIN_ID]["per_user_limit"], admin_data[ADMIN_ID]["step"] = -1 if pl == 0 else pl, "OFFER_HOURS"
-                bot.send_message(ADMIN_ID, "⏳ <b>Active for how many hours?</b> (e.g. 24 or 48):", parse_mode="HTML")
-            except Exception: bot.send_message(ADMIN_ID, "❌ Invalid number.")
+                admin_data[chat_id]["per_user_limit"], admin_data[chat_id]["step"] = -1 if pl == 0 else pl, "OFFER_HOURS"
+                bot.send_message(chat_id,"⏳ <b>Active for how many hours?</b> (e.g. 24 or 48):", parse_mode="HTML")
+            except Exception: bot.send_message(chat_id,"❌ Invalid number.")
             return
         elif step == "OFFER_HOURS":
             try:
                 hrs = float(re.sub(r"[^\d.]", "", message.text.strip()))
                 off_code, now_ts = "off_" + str(uuid.uuid4())[:6], time.time()
                 doc = {
-                    "offer_code": off_code, "discount_percent": admin_data[ADMIN_ID]["discount"],
-                    "target_type": admin_data[ADMIN_ID]["target_type"], "target_course_id": admin_data[ADMIN_ID].get("target_course_id"),
-                    "max_users": admin_data[ADMIN_ID]["max_users"], "per_user_limit": admin_data[ADMIN_ID].get("per_user_limit", 1), "used_count": 0, "created_at_ts": now_ts,
+                    "offer_code": off_code, "discount_percent": admin_data[chat_id]["discount"],
+                    "target_type": admin_data[chat_id]["target_type"], "target_course_id": admin_data[chat_id].get("target_course_id"),
+                    "max_users": admin_data[chat_id]["max_users"], "per_user_limit": admin_data[chat_id].get("per_user_limit", 1), "used_count": 0, "created_at_ts": now_ts,
                     "expires_at_ts": now_ts + (hrs * 3600), "expires_str": (datetime.now(IST) + timedelta(hours=hrs)).strftime("%d-%m-%Y %I:%M %p")
                 }
                 offers_col.insert_one(doc)
-                bot.send_message(ADMIN_ID, f"🎉 <b>Discount Offer Link Created!</b>\n👉 <code>https://t.me/{bot.get_me().username}?start={off_code}</code>", parse_mode="HTML")
-                del admin_data[ADMIN_ID]
-                send_admin_panel(ADMIN_ID)
-            except Exception: bot.send_message(ADMIN_ID, "❌ Invalid hours.")
+                bot.send_message(chat_id,f"🎉 <b>Discount Offer Link Created!</b>\n👉 <code>https://t.me/{bot.get_me().username}?start={off_code}</code>", parse_mode="HTML")
+                del admin_data[chat_id]
+                send_admin_panel(chat_id)
+            except Exception: bot.send_message(chat_id,"❌ Invalid hours.")
             return
         elif step == "MENU_CUSTOM_CONTENT":
             mt, fid = "text", None
             if message.photo: mt, fid = "photo", message.photo[-1].file_id
             elif message.video: mt, fid = "video", message.video.file_id
-            admin_data[ADMIN_ID]["menu_content"] = {"media_type": mt, "file_id": fid, "text": get_formatted_text(message)}
-            admin_data[ADMIN_ID]["buttons"], admin_data[ADMIN_ID]["step"] = [], "MENU_ADD_BUTTONS"
+            admin_data[chat_id]["menu_content"] = {"media_type": mt, "file_id": fid, "text": get_formatted_text(message)}
+            admin_data[chat_id]["buttons"], admin_data[chat_id]["step"] = [], "MENU_ADD_BUTTONS"
             m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish & Save", callback_data="menu_finish_save"))
-            bot.send_message(ADMIN_ID, "✅ <b>Content Saved!</b>\nAdd buttons: <code>Button Name - Link</code> (or type <code>Close - close</code>).", reply_markup=m, parse_mode="HTML")
+            bot.send_message(chat_id,"✅ <b>Content Saved!</b>\nAdd buttons: <code>Button Name - Link</code> (or type <code>Close - close</code>).", reply_markup=m, parse_mode="HTML")
             return
         elif step == "MENU_ADD_BUTTONS":
             txt = message.text.strip()
             if " - " in txt:
                 try:
                     t, u = txt.split(" - ", 1)
-                    admin_data[ADMIN_ID]["buttons"].append({"text": t.strip(), "url": u.strip()})
+                    admin_data[chat_id]["buttons"].append({"text": t.strip(), "url": u.strip()})
                     m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish & Save Menu", callback_data="menu_finish_save"))
-                    bot.send_message(ADMIN_ID, f"✅ <b>Button Added! ({len(admin_data[ADMIN_ID]['buttons'])})</b>", reply_markup=m, parse_mode="HTML")
-                except Exception: bot.send_message(ADMIN_ID, "❌ Format error. <code>Name - Link</code>", parse_mode="HTML")
+                    bot.send_message(chat_id,f"✅ <b>Button Added! ({len(admin_data[chat_id]['buttons'])})</b>", reply_markup=m, parse_mode="HTML")
+                except Exception: bot.send_message(chat_id,"❌ Format error. <code>Name - Link</code>", parse_mode="HTML")
             return
         elif step == "GCBTN_ADD":
             txt = message.text.strip()
             if " - " in txt:
                 try:
                     t, u = txt.split(" - ", 1)
-                    admin_data[ADMIN_ID]["buttons"].append({"text": t.strip(), "url": u.strip()})
+                    admin_data[chat_id]["buttons"].append({"text": t.strip(), "url": u.strip()})
                     m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish & Save", callback_data="gcbtn_finish"))
-                    bot.send_message(ADMIN_ID, f"✅ <b>Global Button Added! ({len(admin_data[ADMIN_ID]['buttons'])})</b>\nSend another or Finish:", reply_markup=m, parse_mode="HTML")
-                except Exception: bot.send_message(ADMIN_ID, "❌ Format error. <code>Name - Link</code>", parse_mode="HTML")
+                    bot.send_message(chat_id,f"✅ <b>Global Button Added! ({len(admin_data[chat_id]['buttons'])})</b>\nSend another or Finish:", reply_markup=m, parse_mode="HTML")
+                except Exception: bot.send_message(chat_id,"❌ Format error. <code>Name - Link</code>", parse_mode="HTML")
             return
         elif step == "SUCC_SET_TEXT":
-            admin_data[ADMIN_ID]["text"] = get_formatted_text(message)
-            admin_data[ADMIN_ID]["buttons"] = []
-            admin_data[ADMIN_ID]["step"] = "SUCC_ADD_BTNS"
+            admin_data[chat_id]["text"] = get_formatted_text(message)
+            admin_data[chat_id]["buttons"] = []
+            admin_data[chat_id]["step"] = "SUCC_ADD_BTNS"
             m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish & Save", callback_data="succ_finish"))
-            bot.send_message(ADMIN_ID, "✅ <b>Text Saved!</b>\n\n🔘 <b>Step 2: Add Buttons</b>\nFormat: <code>Button Text - URL</code>", reply_markup=m, parse_mode="HTML")
+            bot.send_message(chat_id,"✅ <b>Text Saved!</b>\n\n🔘 <b>Step 2: Add Buttons</b>\nFormat: <code>Button Text - URL</code>", reply_markup=m, parse_mode="HTML")
             return
         elif step == "SUCC_ADD_BTNS":
             txt = message.text.strip()
             if " - " in txt:
                 try:
                     t, u = txt.split(" - ", 1)
-                    admin_data[ADMIN_ID]["buttons"].append({"text": t.strip(), "url": u.strip()})
+                    admin_data[chat_id]["buttons"].append({"text": t.strip(), "url": u.strip()})
                     m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish & Save", callback_data="succ_finish"))
-                    bot.send_message(ADMIN_ID, f"✅ <b>Button Added! ({len(admin_data[ADMIN_ID]['buttons'])})</b>", reply_markup=m, parse_mode="HTML")
-                except Exception: bot.send_message(ADMIN_ID, "❌ Format error. <code>Button Text - URL</code>", parse_mode="HTML")
+                    bot.send_message(chat_id,f"✅ <b>Button Added! ({len(admin_data[chat_id]['buttons'])})</b>", reply_markup=m, parse_mode="HTML")
+                except Exception: bot.send_message(chat_id,"❌ Format error. <code>Button Text - URL</code>", parse_mode="HTML")
             return
         elif step == "INTL_SET_NAME":
             b_name = message.text.strip()
-            if not b_name: return bot.send_message(ADMIN_ID, "❌ Name cannot be empty.")
-            admin_data[ADMIN_ID]["intl_name"] = b_name
-            admin_data[ADMIN_ID]["step"] = "INTL_SET_CONTENT"
-            bot.send_message(ADMIN_ID, f"✅ <b>Button Name Saved:</b> <code>{b_name}</code>\n\n📝 Send Photo with Caption OR Plain Text:", parse_mode="HTML")
+            if not b_name: return bot.send_message(chat_id,"❌ Name cannot be empty.")
+            admin_data[chat_id]["intl_name"] = b_name
+            admin_data[chat_id]["step"] = "INTL_SET_CONTENT"
+            bot.send_message(chat_id,f"✅ <b>Button Name Saved:</b> <code>{b_name}</code>\n\n📝 Send Photo with Caption OR Plain Text:", parse_mode="HTML")
             return
         elif step == "INTL_SET_CONTENT":
             fid = message.photo[-1].file_id if message.photo else None
             txt = get_formatted_text(message)
-            admin_data[ADMIN_ID]["intl_photo"] = fid
-            admin_data[ADMIN_ID]["intl_text"] = txt
-            admin_data[ADMIN_ID]["intl_buttons"] = []
-            admin_data[ADMIN_ID]["step"] = "INTL_ADD_BUTTONS"
+            admin_data[chat_id]["intl_photo"] = fid
+            admin_data[chat_id]["intl_text"] = txt
+            admin_data[chat_id]["intl_buttons"] = []
+            admin_data[chat_id]["step"] = "INTL_ADD_BUTTONS"
             m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish & Save", callback_data="intl_finish_save"))
-            bot.send_message(ADMIN_ID, "✅ <b>Content Saved!</b> Add Action Buttons: <code>Button Text - URL</code>", reply_markup=m, parse_mode="HTML")
+            bot.send_message(chat_id,"✅ <b>Content Saved!</b> Add Action Buttons: <code>Button Text - URL</code>", reply_markup=m, parse_mode="HTML")
             return
         elif step == "INTL_ADD_BUTTONS":
             txt = message.text.strip()
             if " - " in txt:
                 try:
                     t, u = txt.split(" - ", 1)
-                    admin_data[ADMIN_ID]["intl_buttons"].append({"text": t.strip(), "url": u.strip()})
+                    admin_data[chat_id]["intl_buttons"].append({"text": t.strip(), "url": u.strip()})
                     m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish & Save", callback_data="intl_finish_save"))
-                    bot.send_message(ADMIN_ID, f"✅ <b>Button Added! ({len(admin_data[ADMIN_ID]['intl_buttons'])})</b>", reply_markup=m, parse_mode="HTML")
-                except Exception: bot.send_message(ADMIN_ID, "❌ Format error.", parse_mode="HTML")
+                    bot.send_message(chat_id,f"✅ <b>Button Added! ({len(admin_data[chat_id]['intl_buttons'])})</b>", reply_markup=m, parse_mode="HTML")
+                except Exception: bot.send_message(chat_id,"❌ Format error.", parse_mode="HTML")
             return
         elif step == "PROMO":
             mt, fid = "text", None
             if message.photo: mt, fid = "photo", message.photo[-1].file_id
             elif message.video: mt, fid = "video", message.video.file_id
-            admin_data[ADMIN_ID]["promo"].append({"type": mt, "file_id": fid, "caption": get_formatted_text(message)})
+            admin_data[chat_id]["promo"].append({"type": mt, "file_id": fid, "caption": get_formatted_text(message)})
             m = InlineKeyboardMarkup().row(InlineKeyboardButton("➡️ Next Step (Price)", callback_data="next_price"))
-            bot.send_message(ADMIN_ID, f"✅ <b>{mt.capitalize()} saved!</b>", reply_markup=m, parse_mode="HTML")
+            bot.send_message(chat_id,f"✅ <b>{mt.capitalize()} saved!</b>", reply_markup=m, parse_mode="HTML")
             return
         elif step == "AMOUNT":
             amt = re.sub(r"[^\d.]", "", message.text.strip())
-            if not amt: return bot.send_message(ADMIN_ID, "❌ <b>Numbers only.</b>", parse_mode="HTML")
-            admin_data[ADMIN_ID]["amount"], admin_data[ADMIN_ID]["step"] = amt, "CAPTION"
+            if not amt: return bot.send_message(chat_id,"❌ <b>Numbers only.</b>", parse_mode="HTML")
+            admin_data[chat_id]["amount"], admin_data[chat_id]["step"] = amt, "CAPTION"
             m = InlineKeyboardMarkup().row(InlineKeyboardButton("⏭ Skip (No Caption)", callback_data="skip_caption"))
-            bot.send_message(ADMIN_ID, f"✅ <b>Price ₹{amt} saved!</b>\n📝 Type optional extra caption, or skip:", reply_markup=m, parse_mode="HTML")
+            bot.send_message(chat_id,f"✅ <b>Price ₹{amt} saved!</b>\n📝 Type optional extra caption, or skip:", reply_markup=m, parse_mode="HTML")
             return
         elif step == "CAPTION":
-            admin_data[ADMIN_ID]["caption"] = get_formatted_text(message)
-            admin_data[ADMIN_ID]["course_buttons"] = []
-            admin_data[ADMIN_ID]["step"] = "COURSE_BUTTONS"
+            admin_data[chat_id]["caption"] = get_formatted_text(message)
+            admin_data[chat_id]["course_buttons"] = []
+            admin_data[chat_id]["step"] = "COURSE_BUTTONS"
             m = InlineKeyboardMarkup().row(InlineKeyboardButton("⏭ Finish Buttons", callback_data="skip_course_buttons"))
-            bot.send_message(ADMIN_ID, "✅ <b>Caption saved!</b>\n🔘 Optional Extra Buttons: <code>Button Text - URL</code>", reply_markup=m, parse_mode="HTML")
+            bot.send_message(chat_id,"✅ <b>Caption saved!</b>\n🔘 Optional Extra Buttons: <code>Button Text - URL</code>", reply_markup=m, parse_mode="HTML")
             return
         elif step == "COURSE_BUTTONS":
             txt = message.text.strip()
             if " - " in txt:
                 try:
                     t, u = txt.split(" - ", 1)
-                    admin_data[ADMIN_ID]["course_buttons"].append({"text": t.strip(), "url": u.strip()})
+                    admin_data[chat_id]["course_buttons"].append({"text": t.strip(), "url": u.strip()})
                     m = InlineKeyboardMarkup().row(InlineKeyboardButton("⏭ Finish Buttons", callback_data="skip_course_buttons"))
-                    bot.send_message(ADMIN_ID, f"✅ <b>Button Added! ({len(admin_data[ADMIN_ID]['course_buttons'])})</b>", reply_markup=m, parse_mode="HTML")
-                except Exception: bot.send_message(ADMIN_ID, "❌ Format error.", parse_mode="HTML")
+                    bot.send_message(chat_id,f"✅ <b>Button Added! ({len(admin_data[chat_id]['course_buttons'])})</b>", reply_markup=m, parse_mode="HTML")
+                except Exception: bot.send_message(chat_id,"❌ Format error.", parse_mode="HTML")
             return
         elif step == "SECRET":
             cid = "c_" + str(uuid.uuid4())[:6]
             courses_col.update_one({"course_id": cid}, {"$set": {
-                "course_id": cid, "title": admin_data[ADMIN_ID].get("title", cid), "promo_media": admin_data[ADMIN_ID]["promo"], "amount": admin_data[ADMIN_ID]["amount"],
-                "custom_caption": admin_data[ADMIN_ID].get("caption",""), "secret_text": get_formatted_text(message),
-                "extra_buttons": admin_data[ADMIN_ID].get("course_buttons", [])
+                "course_id": cid, "title": admin_data[chat_id].get("title", cid), "promo_media": admin_data[chat_id]["promo"], "amount": admin_data[chat_id]["amount"],
+                "custom_caption": admin_data[chat_id].get("caption",""), "secret_text": get_formatted_text(message),
+                "extra_buttons": admin_data[chat_id].get("course_buttons", [])
             }}, upsert=True)
-            if admin_data[ADMIN_ID].get("mode") == "single":
-                bot.send_message(ADMIN_ID, f"🎉 <b>Pack created!</b>\n👉 <code>https://t.me/{bot.get_me().username}?start={cid}</code>", parse_mode="HTML")
-                del admin_data[ADMIN_ID]
-                send_admin_panel(ADMIN_ID)
-            elif admin_data[ADMIN_ID].get("mode") == "batch":
-                admin_data[ADMIN_ID]["course_ids"].append(cid)
-                admin_data[ADMIN_ID]["step"] = "NEXT_ACTION"
+            if admin_data[chat_id].get("mode") == "single":
+                bot.send_message(chat_id,f"🎉 <b>Pack created!</b>\n👉 <code>https://t.me/{bot.get_me().username}?start={cid}</code>", parse_mode="HTML")
+                del admin_data[chat_id]
+                send_admin_panel(chat_id)
+            elif admin_data[chat_id].get("mode") == "batch":
+                admin_data[chat_id]["course_ids"].append(cid)
+                admin_data[chat_id]["step"] = "NEXT_ACTION"
                 m = InlineKeyboardMarkup().row(InlineKeyboardButton("➕ Add Another", callback_data="batch_add_next")).row(InlineKeyboardButton("✅ Finish Batch", callback_data="batch_finish"))
-                bot.send_message(ADMIN_ID, "✅ <b>Pack saved!</b>", reply_markup=m, parse_mode="HTML")
+                bot.send_message(chat_id,"✅ <b>Pack saved!</b>", reply_markup=m, parse_mode="HTML")
             return
         elif step == "CHANNEL_ID":
             channel_id = None
@@ -1248,17 +1330,17 @@ def handle_all_messages(message):
                 elif text.startswith("-100") and text.replace("-", "").isdigit(): channel_id = int(text)
             
             if not channel_id:
-                return bot.send_message(ADMIN_ID, "❌ Please forward a message from the Private Channel/Group or send its link.")
+                return bot.send_message(chat_id,"❌ Please forward a message from the Private Channel/Group or send its link.")
             
             try:
                 chat_info = bot.get_chat(channel_id)
                 channel_name = chat_info.title if chat_info.title else "Private Channel"
                 link = bot.create_chat_invite_link(channel_id, creates_join_request=True)
                 
-                if "channels" not in admin_data[ADMIN_ID]:
-                    admin_data[ADMIN_ID]["channels"] = []
+                if "channels" not in admin_data[chat_id]:
+                    admin_data[chat_id]["channels"] = []
                     
-                admin_data[ADMIN_ID]["channels"].append({
+                admin_data[chat_id]["channels"].append({
                     "id": channel_id,
                     "name": channel_name,
                     "link": link.invite_link
@@ -1269,41 +1351,41 @@ def handle_all_messages(message):
                 ).row(
                     InlineKeyboardButton("✅ Finish & Save Pack", callback_data="batch_finish_channel")
                 )
-                bot.send_message(ADMIN_ID, f"✅ <b>Added: {channel_name}</b>\n\nDo you want to add another channel to this pack, or finish?", reply_markup=m, parse_mode="HTML")
+                bot.send_message(chat_id,f"✅ <b>Added: {channel_name}</b>\n\nDo you want to add another channel to this pack, or finish?", reply_markup=m, parse_mode="HTML")
             except Exception as e:
-                bot.send_message(ADMIN_ID, f"❌ Error: Make sure the bot is an Admin in the Channel/Group first! ({e})")
+                bot.send_message(chat_id,f"❌ Error: Make sure the bot is an Admin in the Channel/Group first! ({e})")
             return
         elif step == "TITLE":
-            admin_data[ADMIN_ID]["title"], admin_data[ADMIN_ID]["step"], admin_data[ADMIN_ID]["promo"] = message.text.strip(), "PROMO", []
+            admin_data[chat_id]["title"], admin_data[chat_id]["step"], admin_data[chat_id]["promo"] = message.text.strip(), "PROMO", []
             m = InlineKeyboardMarkup().row(InlineKeyboardButton("➡️ Next Step", callback_data="next_price"))
-            bot.send_message(ADMIN_ID, "✅ Title saved. <b>Send promo media/text:</b>", reply_markup=m, parse_mode="HTML")
+            bot.send_message(chat_id,"✅ Title saved. <b>Send promo media/text:</b>", reply_markup=m, parse_mode="HTML")
             return
         elif step in ["BC_MEDIA", "FTL_MEDIA"]:
             mt, fid = "text", None
             if message.photo: mt, fid = "photo", message.photo[-1].file_id
             elif message.video: mt, fid = "video", message.video.file_id
             elif message.document: mt, fid = "document", message.document.file_id
-            admin_data[ADMIN_ID].setdefault("media", []).append({"type": mt, "file_id": fid, "caption": get_formatted_text(message)})
+            admin_data[chat_id].setdefault("media", []).append({"type": mt, "file_id": fid, "caption": get_formatted_text(message)})
             cb = "bc_done" if step == "BC_MEDIA" else "ftl_done"
             m = InlineKeyboardMarkup().row(InlineKeyboardButton("✅ Done Adding", callback_data=cb))
-            bot.send_message(ADMIN_ID, "✅ <b>Saved!</b> Send another or click Done.", reply_markup=m, parse_mode="HTML")
+            bot.send_message(chat_id,"✅ <b>Saved!</b> Send another or click Done.", reply_markup=m, parse_mode="HTML")
             return
         elif step in ["BC_BUTTONS", "FTL_BUTTONS"]:
             txt = message.text.strip()
             if " - " in txt:
                 try:
                     t, u = txt.split(" - ", 1)
-                    admin_data[ADMIN_ID].setdefault("buttons", []).append({"text": t.strip(), "url": u.strip()})
+                    admin_data[chat_id].setdefault("buttons", []).append({"text": t.strip(), "url": u.strip()})
                     cb = "bc_finish" if step == "BC_BUTTONS" else "ftl_finish"
                     m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish", callback_data=cb))
-                    bot.send_message(ADMIN_ID, "✅ <b>Button Added!</b>", reply_markup=m, parse_mode="HTML")
-                except Exception: bot.send_message(ADMIN_ID, "❌ Format Error.", parse_mode="HTML")
+                    bot.send_message(chat_id,"✅ <b>Button Added!</b>", reply_markup=m, parse_mode="HTML")
+                except Exception: bot.send_message(chat_id,"❌ Format Error.", parse_mode="HTML")
             return
         elif step == "BC_TIME":
             try:
                 hrs = float(re.sub(r"[^\d.]", "", message.text.strip()))
-                m_items = admin_data[ADMIN_ID].get("media", [])
-                btns = admin_data[ADMIN_ID].get("buttons", [])
+                m_items = admin_data[chat_id].get("media", [])
+                btns = admin_data[chat_id].get("buttons", [])
                 
                 m = InlineKeyboardMarkup()
                 for b in btns:
@@ -1313,7 +1395,7 @@ def handle_all_messages(message):
                     else: m.row(InlineKeyboardButton(b["text"], callback_data=b_url))
                 
                 if not m.keyboard: m = None
-                bot.send_message(ADMIN_ID, "⏳ Broadcasting started...")
+                bot.send_message(chat_id,"⏳ Broadcasting started...")
                 
                 def run_bc():
                     success = 0
@@ -1358,7 +1440,7 @@ def handle_all_messages(message):
                             time.sleep(0.04)
                         except Exception: pass
                         
-                    bot.send_message(ADMIN_ID, f"✅ <b>Broadcast Complete!</b> ({success} users).", parse_mode="HTML")
+                    bot.send_message(chat_id,f"✅ <b>Broadcast Complete!</b> ({success} users).", parse_mode="HTML")
                     
                     if hrs > 0:
                         def delayed_delete(d_list):
@@ -1373,12 +1455,19 @@ def handle_all_messages(message):
                         threading.Timer(hrs * 3600, delayed_delete, args=(delete_list,)).start()
                         
                 threading.Thread(target=run_bc, daemon=True).start()
-                del admin_data[ADMIN_ID]
-                send_admin_panel(ADMIN_ID)
+                del admin_data[chat_id]
+                send_admin_panel(chat_id)
                 
             except Exception:
-                bot.send_message(ADMIN_ID, "❌ Invalid number. Send 0 or higher.")
+                bot.send_message(chat_id,"❌ Invalid number. Send 0 or higher.")
             return
+
+# ये prefixes सिर्फ admins के लिए हैं (user-facing बटन इनमें नहीं आते)
+ADMIN_ONLY_PREFIXES = (
+    "admin_", "back_to_admin", "flash_", "gcbtn_", "succ_", "intl_", "menu_", "batch_",
+    "bc_", "ftl_", "offtarget_", "ctype_", "plan_", "next_price", "skip_caption",
+    "skip_course_buttons", "ch_app_", "ch_can_", "man_appr_", "man_deny_",
+)
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_buttons(call):
@@ -1393,8 +1482,17 @@ def handle_buttons(call):
         except Exception: pass
         return
 
-    if is_maintenance_mode() and chat_id != ADMIN_ID:
+    # actor = जिसने बटन दबाया (channel के बटन में chat_id channel का होता है, इसलिए from_user ज़रूरी है)
+    actor = call.from_user.id
+
+    if is_maintenance_mode() and not is_admin(actor):
         try: bot.answer_callback_query(call.id, "⚠️ Bot is currently under maintenance. Please try again later.", show_alert=True)
+        except Exception: pass
+        return
+
+    # 🔐 Admin-only बटन सिर्फ admins चला सकते हैं (Owner + Dashboard से add किए गए admins)
+    if data.startswith(ADMIN_ONLY_PREFIXES) and not is_admin(actor):
+        try: bot.answer_callback_query(call.id, "⛔ इस ऑप्शन की permission आपके पास नहीं है।", show_alert=True)
         except Exception: pass
         return
 
@@ -1456,6 +1554,9 @@ def handle_buttons(call):
 
     if data.startswith("cancel_order_"):
         oid = data.replace("cancel_order_", "")
+        o_chk = orders_col.find_one({"order_id": oid}, {"user_id": 1, "chat_id": 1})
+        if o_chk and o_chk.get("user_id") != actor and not is_admin(actor):
+            return  # दूसरे user का order cancel नहीं कर सकते
         orders_col.update_one({"order_id": oid}, {"$set": {"status": "CANCELLED"}})
         with pending_lock:
             for k, v in list(pending_orders.items()):
@@ -1473,8 +1574,9 @@ def handle_buttons(call):
             oid = data.replace("paydone_", "")
             order = all_orders_cache.get(oid) or orders_col.find_one({"order_id": oid})
             if not order: return
+            if order.get("user_id") != actor and not is_admin(actor): return  # दूसरे का order verify नहीं होगा
             if order.get("status") in ("COMPLETED_AUTO", "COMPLETED_MANUAL"): return
-            
+
             amt_key = order.get("amount")
             sms_rec = sms_pool_col.find_one({"amount": amt_key, "status": "UNUSED"})
             if sms_rec:
@@ -1495,6 +1597,8 @@ def handle_buttons(call):
         return
 
     if data.startswith("send_ss_"):
+        o_chk = orders_col.find_one({"order_id": data.replace("send_ss_", "")}, {"user_id": 1})
+        if o_chk and o_chk.get("user_id") != actor and not is_admin(actor): return
         set_user_state(chat_id, "WAITING_PAYMENT_SS", data.replace("send_ss_", ""))
         bot.send_message(chat_id, "📸 <b>Please send your payment screenshot.</b>", parse_mode="HTML", msg_type="general")
         return
@@ -1632,14 +1736,19 @@ def handle_buttons(call):
         return
 
     # ADMIN PANEL HANDLERS
-    if data == "admin_flash_price":
+    if data == "admin_home":
+        bot.edit_message_text(ADMIN_HOME_TEXT, chat_id=chat_id, message_id=msg_id, reply_markup=admin_home_markup(), parse_mode="HTML")
+    elif data.startswith("admin_cat_"):
+        cat = data[len("admin_cat_"):]
+        if cat in ADMIN_CATEGORIES: show_admin_category(chat_id, msg_id, cat)
+    elif data == "admin_flash_price":
         m = InlineKeyboardMarkup()
         m.row(InlineKeyboardButton("📈 Price Hike (+)", callback_data="flash_start_hike"), InlineKeyboardButton("📉 Price Drop (-)", callback_data="flash_start_drop"))
         m.row(InlineKeyboardButton("🔄 Reset to Normal Prices", callback_data="flash_reset"))
         m.row(InlineKeyboardButton("🔙 Back", callback_data="back_to_admin"))
         bot.edit_message_text("⚡ <b>Flash Price Manager</b>", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
     elif data in ["flash_start_hike", "flash_start_drop"]:
-        admin_data[ADMIN_ID] = {"step": "FLASH_PCT", "flash_mode": "hike" if data == "flash_start_hike" else "drop"}
+        admin_data[chat_id] = {"step": "FLASH_PCT", "flash_mode": "hike" if data == "flash_start_hike" else "drop"}
         bot.edit_message_text("✏️ <b>Enter Percentage:</b>\n(e.g., Send 20 for 20%)", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "flash_reset":
         settings_col.delete_one({"_id": "flash_sale"})
@@ -1647,28 +1756,28 @@ def handle_buttons(call):
         bot.edit_message_text("✅ <b>All prices reset to normal!</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
         send_admin_panel(chat_id)
     elif data == "flash_tgt_all":
-        admin_data[ADMIN_ID]["target"] = "all"
-        admin_data[ADMIN_ID]["step"] = "FLASH_HOURS"
+        admin_data[chat_id]["target"] = "all"
+        admin_data[chat_id]["step"] = "FLASH_HOURS"
         bot.edit_message_text("⏳ <b>Active for how many hours?</b> (e.g., 24)", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "flash_tgt_single":
-        admin_data[ADMIN_ID]["target"] = "single"
-        admin_data[ADMIN_ID]["step"] = "FLASH_CID"
+        admin_data[chat_id]["target"] = "single"
+        admin_data[chat_id]["step"] = "FLASH_CID"
         bot.edit_message_text("🎯 <b>Send Course ID:</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "skip_course_buttons":
-        admin_data[ADMIN_ID]["step"] = "COURSE_TYPE"
+        admin_data[chat_id]["step"] = "COURSE_TYPE"
         m = InlineKeyboardMarkup().row(InlineKeyboardButton("📝 Text / Secret Link", callback_data="ctype_text"), InlineKeyboardButton("📢 Private Channel/Group", callback_data="ctype_channel"))
         bot.edit_message_text("✅ <b>Buttons saved!</b>\nWhat will the user get after payment?", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
     elif data == "admin_global_cbtns":
         m = InlineKeyboardMarkup().row(InlineKeyboardButton("➕ Add/Update Buttons", callback_data="gcbtn_add")).row(InlineKeyboardButton("🗑 Clear All Buttons", callback_data="gcbtn_clear")).row(InlineKeyboardButton("🔙 Back", callback_data="back_to_admin"))
         bot.edit_message_text("🔘 <b>Global Course Buttons</b>", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
     elif data == "gcbtn_add":
-        admin_data[ADMIN_ID] = {"step": "GCBTN_ADD", "buttons": []}
+        admin_data[chat_id] = {"step": "GCBTN_ADD", "buttons": []}
         bot.edit_message_text("➕ Send format: <code>Button Text - URL</code>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "gcbtn_finish":
-        d = admin_data.get(ADMIN_ID, {})
+        d = admin_data.get(chat_id, {})
         settings_col.update_one({"_id": "global_course_btns"}, {"$set": {"buttons": d.get("buttons", []), "updated_at": get_ist_time()}}, upsert=True)
         invalidate_cache("global_course_btns")
-        del admin_data[ADMIN_ID]
+        del admin_data[chat_id]
         bot.edit_message_text("🎉 <b>Global Buttons Saved!</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
         send_admin_panel(chat_id)
     elif data == "gcbtn_clear":
@@ -1680,18 +1789,18 @@ def handle_buttons(call):
         m = InlineKeyboardMarkup().row(InlineKeyboardButton("✏️ Set Up Success Message", callback_data="succ_set_text")).row(InlineKeyboardButton("🗑 Clear Settings", callback_data="succ_clear")).row(InlineKeyboardButton("🔙 Back", callback_data="back_to_admin"))
         bot.edit_message_text("🎉 <b>Post-Purchase (Success) Message</b>", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
     elif data == "succ_set_text":
-        admin_data[ADMIN_ID] = {"step": "SUCC_SET_TEXT"}
+        admin_data[chat_id] = {"step": "SUCC_SET_TEXT"}
         m = InlineKeyboardMarkup().row(InlineKeyboardButton("⏭ Skip Text", callback_data="succ_skip_text"))
         bot.edit_message_text("✏️ Send extra caption/text:", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
     elif data == "succ_skip_text":
-        admin_data[ADMIN_ID] = {"step": "SUCC_ADD_BTNS", "text": "", "buttons": []}
+        admin_data[chat_id] = {"step": "SUCC_ADD_BTNS", "text": "", "buttons": []}
         m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish & Save", callback_data="succ_finish"))
         bot.edit_message_text("🔘 Add Buttons: <code>Button Text - URL</code>", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
     elif data == "succ_finish":
-        d = admin_data.get(ADMIN_ID, {})
+        d = admin_data.get(chat_id, {})
         settings_col.update_one({"_id": "success_msg_cfg"}, {"$set": {"text": d.get("text", ""), "buttons": d.get("buttons", []), "updated_at": get_ist_time()}}, upsert=True)
         invalidate_cache("success_msg_cfg")
-        del admin_data[ADMIN_ID]
+        del admin_data[chat_id]
         bot.edit_message_text("🎉 <b>Settings Saved!</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
         send_admin_panel(chat_id)
     elif data == "succ_clear":
@@ -1720,14 +1829,14 @@ def handle_buttons(call):
         m = InlineKeyboardMarkup().row(InlineKeyboardButton("✏️ Customize", callback_data="intl_customize")).row(InlineKeyboardButton("🗑 Reset Default", callback_data="intl_reset_default")).row(InlineKeyboardButton("🔙 Back", callback_data="back_to_admin"))
         bot.edit_message_text("🌍 <b>Customize International Button</b>", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
     elif data == "intl_customize":
-        admin_data[ADMIN_ID] = {"step": "INTL_SET_NAME"}
+        admin_data[chat_id] = {"step": "INTL_SET_NAME"}
         bot.edit_message_text("✏️ Send Name (e.g. <code>🌍 International Pay</code>):", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "intl_finish_save":
-        d = admin_data.get(ADMIN_ID, {})
+        d = admin_data.get(chat_id, {})
         doc = {"_id": "intl_btn_cfg", "btn_name": d.get("intl_name", "🌍 International"), "photo_id": d.get("intl_photo"), "text": d.get("intl_text", ""), "buttons": d.get("intl_buttons", []), "updated_at": get_ist_time()}
         settings_col.update_one({"_id": "intl_btn_cfg"}, {"$set": doc}, upsert=True)
         invalidate_cache("intl_btn_cfg")
-        del admin_data[ADMIN_ID]
+        del admin_data[chat_id]
         bot.edit_message_text("🎉 <b>Saved successfully!</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
         send_admin_panel(chat_id)
     elif data == "intl_reset_default":
@@ -1746,32 +1855,32 @@ def handle_buttons(call):
                 if c: send_course_to_user(chat_id, c)
         threading.Thread(target=_bg_plans, daemon=True).start()
     elif data == "ctype_text":
-        admin_data[ADMIN_ID]["step"] = "SECRET"
+        admin_data[chat_id]["step"] = "SECRET"
         bot.edit_message_text("✅ <b>Send secret link or text:</b>", chat_id, msg_id, parse_mode="HTML")
     elif data == "ctype_channel":
-        admin_data[ADMIN_ID]["step"] = "CHANNEL_ID"
-        admin_data[ADMIN_ID]["channels"] = []
+        admin_data[chat_id]["step"] = "CHANNEL_ID"
+        admin_data[chat_id]["channels"] = []
         bot.edit_message_text("📢 <b>Forward a message OR send Private Channel Link:</b>", chat_id, msg_id, parse_mode="HTML")
-    elif data == "skip_caption" and ADMIN_ID in admin_data:
-        admin_data[ADMIN_ID]["caption"] = ""
-        admin_data[ADMIN_ID]["course_buttons"] = []
-        admin_data[ADMIN_ID]["step"] = "COURSE_BUTTONS"
+    elif data == "skip_caption" and chat_id in admin_data:
+        admin_data[chat_id]["caption"] = ""
+        admin_data[chat_id]["course_buttons"] = []
+        admin_data[chat_id]["step"] = "COURSE_BUTTONS"
         m = InlineKeyboardMarkup().row(InlineKeyboardButton("⏭ Finish Buttons", callback_data="skip_course_buttons"))
         bot.edit_message_text("🔘 Add Extra Buttons: <code>Text - URL</code>", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
     elif data == "admin_create_offer":
-        admin_data[ADMIN_ID] = {"step": "OFFER_DISCOUNT"}
+        admin_data[chat_id] = {"step": "OFFER_DISCOUNT"}
         bot.edit_message_text("🎟 <b>Enter Discount % (e.g. 50):</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "offtarget_all":
-        admin_data[ADMIN_ID]["target_type"], admin_data[ADMIN_ID]["step"] = "all", "OFFER_LIMIT"
+        admin_data[chat_id]["target_type"], admin_data[chat_id]["step"] = "all", "OFFER_LIMIT"
         bot.edit_message_text("👥 Max claims? (0 = unlimited):", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "offtarget_single":
-        admin_data[ADMIN_ID]["target_type"], admin_data[ADMIN_ID]["step"] = "single", "OFFER_SINGLE_CID"
+        admin_data[chat_id]["target_type"], admin_data[chat_id]["step"] = "single", "OFFER_SINGLE_CID"
         bot.edit_message_text("🎯 Send Course ID (e.g. <code>c_abc123</code>):", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "admin_delete_course":
-        admin_data[ADMIN_ID] = {"step": "DELETE_COURSE"}
+        admin_data[chat_id] = {"step": "DELETE_COURSE"}
         bot.edit_message_text("🗑 Send <b>Course ID / Batch ID / File ID</b> to delete:", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "admin_edit_course":
-        admin_data[ADMIN_ID] = {"step": "EDIT_COURSE_ID"}
+        admin_data[chat_id] = {"step": "EDIT_COURSE_ID"}
         bot.edit_message_text("✏️ Send Course ID to edit:", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "admin_manage_plans":
         c_ids = (get_cached_setting("store_plans") or {}).get("course_ids", [])
@@ -1779,7 +1888,7 @@ def handle_buttons(call):
         m = InlineKeyboardMarkup().row(InlineKeyboardButton("➕ Add Course", callback_data="plan_add_id")).row(InlineKeyboardButton("🗑 Clear All", callback_data="plan_clear_all")).row(InlineKeyboardButton("🔙 Back", callback_data="back_to_admin"))
         bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
     elif data == "plan_add_id":
-        admin_data[ADMIN_ID] = {"step": "ADD_PLAN_ID"}
+        admin_data[chat_id] = {"step": "ADD_PLAN_ID"}
         bot.edit_message_text("➕ Send Course ID:", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "plan_clear_all":
         settings_col.delete_one({"_id": "store_plans"})
@@ -1790,13 +1899,13 @@ def handle_buttons(call):
         m = InlineKeyboardMarkup().row(InlineKeyboardButton("✏️ Set New", callback_data="menu_set_new")).row(InlineKeyboardButton("🗑 Reset Default", callback_data="menu_reset_default")).row(InlineKeyboardButton("🔙 Back", callback_data="back_to_admin"))
         bot.edit_message_text("🎨 <b>Customize Start Menu</b>", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
     elif data == "menu_set_new":
-        admin_data[ADMIN_ID] = {"step": "MENU_CUSTOM_CONTENT"}
+        admin_data[chat_id] = {"step": "MENU_CUSTOM_CONTENT"}
         bot.edit_message_text("📝 Send Photo, Video or Text:", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "menu_finish_save":
-        c = admin_data.get(ADMIN_ID, {}).get("menu_content", {})
-        settings_col.update_one({"_id": "start_menu"}, {"$set": {"media_type": c.get("media_type", "text"), "file_id": c.get("file_id"), "text": c.get("text", ""), "buttons": admin_data.get(ADMIN_ID, {}).get("buttons", []), "updated_at": get_ist_time()}}, upsert=True)
+        c = admin_data.get(chat_id, {}).get("menu_content", {})
+        settings_col.update_one({"_id": "start_menu"}, {"$set": {"media_type": c.get("media_type", "text"), "file_id": c.get("file_id"), "text": c.get("text", ""), "buttons": admin_data.get(chat_id, {}).get("buttons", []), "updated_at": get_ist_time()}}, upsert=True)
         invalidate_cache("start_menu")
-        del admin_data[ADMIN_ID]
+        del admin_data[chat_id]
         bot.edit_message_text("🎉 <b>Saved!</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
         send_admin_panel(chat_id)
     elif data == "menu_reset_default":
@@ -1805,38 +1914,38 @@ def handle_buttons(call):
         bot.edit_message_text("✅ <b>Reset!</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
         send_admin_panel(chat_id)
     elif data == "admin_create_batch":
-        admin_data[ADMIN_ID] = {"mode": "batch", "step": "TITLE", "course_ids": []}
+        admin_data[chat_id] = {"mode": "batch", "step": "TITLE", "course_ids": []}
         bot.edit_message_text("📦 <b>Send Batch Title:</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "admin_batch_existing":
-        admin_data[ADMIN_ID] = {"mode": "batch_existing", "step": "BATCH_EXISTING_TITLE", "course_ids": []}
+        admin_data[chat_id] = {"mode": "batch_existing", "step": "BATCH_EXISTING_TITLE", "course_ids": []}
         bot.edit_message_text("📚 <b>Send Batch Title:</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "admin_add_course":
-        admin_data[ADMIN_ID] = {"mode": "single", "step": "TITLE", "promo": [], "amount": None, "caption": "", "course_buttons": []}
+        admin_data[chat_id] = {"mode": "single", "step": "TITLE", "promo": [], "amount": None, "caption": "", "course_buttons": []}
         bot.edit_message_text("📝 <b>Step 1: Send Course Title</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data in ["admin_file_link", "admin_broadcast"]:
-        admin_data[ADMIN_ID] = {"step": "FTL_MEDIA" if data == "admin_file_link" else "BC_MEDIA", "media": []}
+        admin_data[chat_id] = {"step": "FTL_MEDIA" if data == "admin_file_link" else "BC_MEDIA", "media": []}
         bot.edit_message_text(f"{'📎 File to Link' if data == 'admin_file_link' else '📢 Broadcast'}\nSend Media/Text.", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
-    elif data == "next_price" and ADMIN_ID in admin_data:
-        admin_data[ADMIN_ID]["step"] = "AMOUNT"
+    elif data == "next_price" and chat_id in admin_data:
+        admin_data[chat_id]["step"] = "AMOUNT"
         bot.edit_message_text("💰 <b>Price (INR)</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "batch_add_next":
-        admin_data[ADMIN_ID]["step"], admin_data[ADMIN_ID]["promo"], admin_data[ADMIN_ID]["caption"], admin_data[ADMIN_ID]["course_buttons"] = "TITLE", [], "", []
+        admin_data[chat_id]["step"], admin_data[chat_id]["promo"], admin_data[chat_id]["caption"], admin_data[chat_id]["course_buttons"] = "TITLE", [], "", []
         bot.edit_message_text("📝 <b>Send title for next pack:</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     elif data == "batch_finish":
-        d = admin_data.get(ADMIN_ID)
+        d = admin_data.get(chat_id)
         if d and d.get("course_ids"):
             bid = "b_" + str(uuid.uuid4())[:6]
             batches_col.update_one({"batch_id": bid}, {"$set": {"batch_id": bid, "title": d["title"], "course_ids": d["course_ids"]}}, upsert=True)
             bot.edit_message_text(f"🎉 <b>Batch Created!</b>\n👉 <code>https://t.me/{BOT_USERNAME}?start={bid}</code>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
-            del admin_data[ADMIN_ID]
+            del admin_data[chat_id]
             send_admin_panel(chat_id)
             
     elif data == "batch_add_channel":
-        admin_data[ADMIN_ID]["step"] = "CHANNEL_ID"
+        admin_data[chat_id]["step"] = "CHANNEL_ID"
         bot.edit_message_text("📢 <b>Forward next message OR send next Private Channel Link:</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
         
     elif data == "batch_finish_channel":
-        channels = admin_data.get(ADMIN_ID, {}).get("channels", [])
+        channels = admin_data.get(chat_id, {}).get("channels", [])
         if not channels: return bot.edit_message_text("❌ No channels added.", chat_id=chat_id, message_id=msg_id)
 
         cid = "c_" + str(uuid.uuid4())[:6]
@@ -1852,20 +1961,20 @@ def handle_buttons(call):
         combined_name = " + ".join(channel_names)
 
         courses_col.update_one({"course_id": cid}, {"$set": {
-            "course_id": cid, "title": admin_data[ADMIN_ID].get("title", combined_name),
-            "promo_media": admin_data[ADMIN_ID]["promo"], "amount": admin_data[ADMIN_ID]["amount"],
-            "custom_caption": admin_data[ADMIN_ID].get("caption", ""), "secret_text": secret_text,
+            "course_id": cid, "title": admin_data[chat_id].get("title", combined_name),
+            "promo_media": admin_data[chat_id]["promo"], "amount": admin_data[chat_id]["amount"],
+            "custom_caption": admin_data[chat_id].get("caption", ""), "secret_text": secret_text,
             "channel_ids": channel_ids, "channel_name": combined_name,
-            "extra_buttons": admin_data[ADMIN_ID].get("course_buttons", [])
+            "extra_buttons": admin_data[chat_id].get("course_buttons", [])
         }}, upsert=True)
 
-        if admin_data[ADMIN_ID].get("mode") == "single":
+        if admin_data[chat_id].get("mode") == "single":
             bot.edit_message_text(f"🎉 <b>Channel Pack created! ({combined_name})</b>\n👉 <code>https://t.me/{bot.get_me().username}?start={cid}</code>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
-            del admin_data[ADMIN_ID]
-            send_admin_panel(ADMIN_ID)
-        elif admin_data[ADMIN_ID].get("mode") == "batch":
-            admin_data[ADMIN_ID]["course_ids"].append(cid)
-            admin_data[ADMIN_ID]["step"] = "NEXT_ACTION"
+            del admin_data[chat_id]
+            send_admin_panel(chat_id)
+        elif admin_data[chat_id].get("mode") == "batch":
+            admin_data[chat_id]["course_ids"].append(cid)
+            admin_data[chat_id]["step"] = "NEXT_ACTION"
             m = InlineKeyboardMarkup().row(InlineKeyboardButton("➕ Add Another", callback_data="batch_add_next")).row(InlineKeyboardButton("✅ Finish Batch", callback_data="batch_finish"))
             bot.edit_message_text("✅ <b>Pack saved to batch!</b>", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
             
@@ -1890,20 +1999,20 @@ def handle_buttons(call):
                 if b: send_batch_to_user(chat_id, b)
             threading.Thread(target=_bg_b, daemon=True).start()
     elif data == "bc_done":
-        admin_data[ADMIN_ID]["step"], admin_data[ADMIN_ID]["buttons"] = "BC_BUTTONS", []
-        bot.send_message(ADMIN_ID, "✅ <b>Media Saved!</b> Add button or Finish.", reply_markup=InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish", callback_data="bc_finish")), parse_mode="HTML")
+        admin_data[chat_id]["step"], admin_data[chat_id]["buttons"] = "BC_BUTTONS", []
+        bot.send_message(chat_id,"✅ <b>Media Saved!</b> Add button or Finish.", reply_markup=InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish", callback_data="bc_finish")), parse_mode="HTML")
     elif data == "bc_finish":
-        admin_data[ADMIN_ID]["step"] = "BC_TIME"
-        bot.send_message(ADMIN_ID, "⏳ <b>How many hours should this broadcast stay? (0 for permanent):</b>", parse_mode="HTML")
+        admin_data[chat_id]["step"] = "BC_TIME"
+        bot.send_message(chat_id,"⏳ <b>How many hours should this broadcast stay? (0 for permanent):</b>", parse_mode="HTML")
     elif data == "ftl_done":
-        admin_data[ADMIN_ID]["step"], admin_data[ADMIN_ID]["buttons"] = "FTL_BUTTONS", []
-        bot.send_message(ADMIN_ID, "✅ <b>Media Saved!</b> Add button or Finish.", reply_markup=InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish", callback_data="ftl_finish")), parse_mode="HTML")
+        admin_data[chat_id]["step"], admin_data[chat_id]["buttons"] = "FTL_BUTTONS", []
+        bot.send_message(chat_id,"✅ <b>Media Saved!</b> Add button or Finish.", reply_markup=InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish", callback_data="ftl_finish")), parse_mode="HTML")
     elif data == "ftl_finish":
         fid = "f_" + str(uuid.uuid4())[:6]
-        file_links_col.update_one({"file_code": fid}, {"$set": {"file_code": fid, "media_data": admin_data[ADMIN_ID].get("media", []), "button_data": admin_data[ADMIN_ID].get("buttons", [])}}, upsert=True)
-        bot.send_message(ADMIN_ID, f"🎉 <b>Link Created!</b>\n👉 <code>https://t.me/{BOT_USERNAME}?start={fid}</code>", parse_mode="HTML")
-        del admin_data[ADMIN_ID]
-        send_admin_panel(ADMIN_ID)
+        file_links_col.update_one({"file_code": fid}, {"$set": {"file_code": fid, "media_data": admin_data[chat_id].get("media", []), "button_data": admin_data[chat_id].get("buttons", [])}}, upsert=True)
+        bot.send_message(chat_id,f"🎉 <b>Link Created!</b>\n👉 <code>https://t.me/{BOT_USERNAME}?start={fid}</code>", parse_mode="HTML")
+        del admin_data[chat_id]
+        send_admin_panel(chat_id)
 
 # ==========================================
 # FLASK WEB SERVER & API
@@ -1956,7 +2065,7 @@ def require_auth(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
         auth = request.authorization
-        if not auth or auth.username != DASHBOARD_USERNAME or auth.password != DASHBOARD_PASSWORD:
+        if not auth or not (hmac.compare_digest(auth.username or "", DASHBOARD_USERNAME) and hmac.compare_digest(auth.password or "", DASHBOARD_PASSWORD)):
             return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Dashboard"'})
         return f(*args, **kwargs)
     return wrapper
@@ -1975,7 +2084,12 @@ def _order_ts(o):
 def api_overview():
     completed_q = {"status": {"$in": ["COMPLETED_AUTO", "COMPLETED_MANUAL"]}}
     today_start = (datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)).timestamp()
-    today_amt = sum(float(o.get("amount", 0) or 0) for o in orders_col.find(completed_q) if _order_ts(o) >= today_start)
+    # पहले हर order लोड होता था (धीमा); अब database खुद जोड़ता है (तेज़)
+    agg = list(orders_col.aggregate([
+        {"$match": {**completed_q, "delivered_at_ts": {"$gte": today_start}}},
+        {"$group": {"_id": None, "total": {"$sum": {"$toDouble": "$amount"}}}},
+    ]))
+    today_amt = agg[0]["total"] if agg else 0
     
     return jsonify({
         "total_users": users_col.count_documents({}), "total_qr_generated": orders_col.count_documents({}),
@@ -2034,6 +2148,7 @@ def api_inject_sms():
     d = request.json or {}
     amount = str(d.get("amount", "")).strip()
     if not amount: return jsonify({"error": "Amount is required"}), 400
+    if not re.fullmatch(r"\d+(\.\d{1,2})?", amount): return jsonify({"error": "Amount must be a number, e.g. 50 or 50.01"}), 400
     sms_text = f"You've received Rs.{amount} from Dashboard Test via PhonePe for txn T{int(time.time()*1000)}"
     
     with app.test_client() as client:
@@ -2045,7 +2160,7 @@ def api_inject_sms():
 def api_courses():
     out = []
     for c in courses_col.find().sort("_id", -1):
-        out.append({"course_id": c.get("course_id"), "title": c.get("title", ""), "amount": c.get("amount"), "caption": c.get("custom_caption", "")[:40], "is_channel": bool(c.get("channel_id") or c.get("channel_ids"))})
+        out.append({"course_id": c.get("course_id"), "title": c.get("title", ""), "amount": c.get("amount"), "caption": c.get("custom_caption", "")[:40], "is_channel": bool(c.get("channel_id") or c.get("channel_ids")), "channel_name": c.get("channel_name", "")})
     return jsonify(out)
 
 @app.route("/dashboard/api/courses/<course_id>", methods=["DELETE"])
@@ -2171,14 +2286,52 @@ def api_force_clear_chats():
     threading.Thread(target=manual_clear_all, daemon=True).start()
     return jsonify({"status": "success", "message": "Chat clearing started safely in background."})
 
+@app.route("/dashboard/api/user-lookup")
+@require_auth
+def api_user_lookup():
+    """ऊपर की सर्च बार: ID या username से यूज़र ढूंढो + उसके कोर्स और चैनल के नाम"""
+    q = request.args.get("q", "").strip()
+    if not q: return jsonify([])
+    if q.isdigit():
+        uid = int(q)
+        u = users_col.find_one({"user_id": uid}, {"user_id": 1, "username": 1}) or {}
+        users = [{"user_id": uid, "username": u.get("username", "")}]
+    else:
+        found = users_col.find({"username": {"$regex": re.escape(q.lstrip("@")), "$options": "i"}}, {"user_id": 1, "username": 1}).limit(10)
+        users = [{"user_id": x.get("user_id"), "username": x.get("username", "")} for x in found]
+    users = [u for u in users if u["user_id"] is not None]
+    uids = [u["user_id"] for u in users]
+    purchases = list(purchases_col.find({"user_id": {"$in": uids}}).sort("_id", 1)) if uids else []
+    rows = _purchase_rows(purchases)
+    by_uid = {}
+    for p, row in zip(purchases, rows):
+        by_uid.setdefault(p.get("user_id"), []).append(row)
+    return jsonify([{
+        "user_id": u["user_id"],
+        "username": u["username"],
+        "purchases": by_uid.get(u["user_id"], []),
+    } for u in users])
+
+@app.route("/dashboard/api/purchases", methods=["DELETE"])
+@require_auth
+def api_remove_purchase():
+    """किसी यूज़र का एक कोर्स का खरीदी-रिकॉर्ड हटाता है (इससे नया join access बंद होता है)"""
+    d = request.json or {}
+    try: uid = int(d.get("user_id"))
+    except (TypeError, ValueError): return jsonify({"error": "Invalid user ID"}), 400
+    cid = str(d.get("course_id", "")).strip()
+    if not cid: return jsonify({"error": "Course ID is required"}), 400
+    res = purchases_col.delete_many({"user_id": uid, "item_info": {"$regex": "^" + re.escape(cid) + r" \|"}})
+    return jsonify({"status": "success", "removed": res.deleted_count})
+
 @app.route("/dashboard/api/broadcast", methods=["POST"])
 @require_auth
 def api_broadcast():
     data = request.json or {}
-    msg = data.get("message")
+    msg = (data.get("message") or "").strip()
     btns = data.get("buttons", [])
     if not msg: return jsonify({"error": "Empty message"}), 400
-    
+
     markup = telebot.types.InlineKeyboardMarkup()
     for b in btns:
         if b.get("text") and b.get("url"):
@@ -2186,22 +2339,77 @@ def api_broadcast():
             if b_url.lower() == "close": markup.add(telebot.types.InlineKeyboardButton(b["text"], callback_data="close_msg"))
             elif b_url.startswith("http"): markup.add(telebot.types.InlineKeyboardButton(b["text"], url=b_url))
             else: markup.add(telebot.types.InlineKeyboardButton(b["text"], callback_data=b_url))
-                
     if not markup.keyboard: markup = None
-    
+
+    bid = "bc_" + uuid.uuid4().hex[:8]
+    broadcasts_col.insert_one({
+        "bid": bid, "message": msg, "created_at": get_ist_time(), "created_ts": time.time(),
+        "status": "SENDING", "sent": [], "sent_count": 0, "removed": False,
+    })
+
     def run_bc():
-        sent_count = 0
-        for u in users_col.find():
+        sent = []
+        for u in users_col.find({}):
             raw_uid = u.get("user_id") or u.get("chat_id") or u.get("_id")
             if not raw_uid: continue
             try:
-                bot.send_message(int(raw_uid), msg, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
-                sent_count += 1
+                uid = int(raw_uid)
+                m_sent = bot.send_message(uid, msg, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
+                sent.append([uid, m_sent.message_id])
                 time.sleep(0.04)
             except Exception: pass
-            
+        # भेजे गए हर message की ID सेव होती है, ताकि बाद में सबकी चैट से हटाया जा सके
+        broadcasts_col.update_one({"bid": bid}, {"$set": {"status": "SENT", "sent": sent, "sent_count": len(sent)}})
+
     threading.Thread(target=run_bc, daemon=True).start()
+    return jsonify({"status": "success", "bid": bid})
+
+@app.route("/dashboard/api/broadcasts")
+@require_auth
+def api_broadcasts():
+    out = []
+    for b in broadcasts_col.find({}, {"sent": 0}).sort("created_ts", -1).limit(30):
+        out.append({
+            "bid": b.get("bid"), "message": b.get("message", ""), "created_at": b.get("created_at", ""),
+            "status": b.get("status", ""), "sent_count": b.get("sent_count", 0), "removed": b.get("removed", False),
+        })
+    return jsonify(out)
+
+@app.route("/dashboard/api/broadcasts/<bid>", methods=["DELETE"])
+@require_auth
+def api_remove_broadcast(bid):
+    """भेजे गए broadcast को सभी यूज़र्स की चैट से हटाता है (Telegram 48 घंटे के अंदर वाले messages हटाने देता है)"""
+    b = broadcasts_col.find_one({"bid": bid})
+    if not b: return jsonify({"error": "Broadcast not found"}), 404
+    if b.get("removed"): return jsonify({"error": "This broadcast was already removed"}), 400
+    if b.get("status") != "SENT": return jsonify({"error": "Broadcast is still sending. Remove it after it finishes"}), 400
+
+    def run_rm():
+        for uid, mid in b.get("sent", []):
+            try: bot.delete_message(uid, mid)
+            except Exception: pass
+            time.sleep(0.05)
+        broadcasts_col.update_one({"bid": bid}, {"$set": {"removed": True, "sent": []}})
+
+    threading.Thread(target=run_rm, daemon=True).start()
     return jsonify({"status": "success"})
+
+DASH_ICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+                 '<rect width="64" height="64" rx="16" fill="#4f8cff"/>'
+                 '<text x="32" y="43" font-size="34" text-anchor="middle">🛍</text></svg>')
+
+@app.route("/dashboard/icon.svg")
+def dashboard_icon():
+    return Response(DASH_ICON_SVG, mimetype="image/svg+xml")
+
+@app.route("/dashboard/manifest.json")
+def dashboard_manifest():
+    """Dashboard को phone/PC में App की तरह install करने के लिए"""
+    return jsonify({
+        "name": "Store Dashboard", "short_name": "Store", "start_url": "/dashboard", "display": "standalone",
+        "background_color": "#0b0f14", "theme_color": "#0b0f14",
+        "icons": [{"src": "/dashboard/icon.svg", "sizes": "any", "type": "image/svg+xml"}],
+    })
 
 @app.route("/dashboard/api/channel-logs")
 @require_auth
@@ -2221,6 +2429,30 @@ def api_channel_logs():
 def api_sms_pool():
     return jsonify([{"amount": s.get("amount"), "created_at": s.get("created_at_str"), "preview": (s.get("raw_text") or "")[:100]} for s in sms_pool_col.find({"status": "UNUSED"}).sort("created_at_dt", -1).limit(100)])
 
+def _cid_of(p):
+    """खरीदी के रिकॉर्ड से course ID निकालता है (item_info = 'c_xxx | Rate: ...')"""
+    return (p.get("item_info") or "").split(" |")[0].strip()
+
+def _purchase_rows(purchases):
+    """खरीदी के रिकॉर्ड को dashboard के लिए आसान format में बदलता है (कोर्स + चैनल का नाम)"""
+    cids = list({_cid_of(p) for p in purchases if _cid_of(p)})
+    cmap = {}
+    if cids:
+        for c in courses_col.find({"course_id": {"$in": cids}}, {"course_id": 1, "channel_name": 1, "title": 1}):
+            cmap[c.get("course_id")] = c
+    rows = []
+    for p in purchases:
+        cid = _cid_of(p)
+        c = cmap.get(cid, {})
+        rows.append({
+            "course_id": cid,
+            "title": p.get("title") or c.get("title") or cid,
+            "channel_name": c.get("channel_name") or "",
+            "date": p.get("date", ""),
+            "link": p.get("link", ""),
+        })
+    return rows
+
 @app.route("/dashboard/api/users")
 @require_auth
 def api_users():
@@ -2228,241 +2460,798 @@ def api_users():
     query = {}
     if search_q:
         if search_q.isdigit(): query = {"user_id": int(search_q)}
-        else: query = {"username": {"$regex": search_q, "$options": "i"}}
-    
-    out = []
-    for u in users_col.find(query).sort("updated_at", -1).limit(200):
-        uid = u.get("user_id")
-        user_purchases = list(purchases_col.find({"user_id": uid}))
-        out.append({
-            "user_id": uid, 
-            "username": u.get("username", "None"), 
-            "updated_at": u.get("updated_at"),
-            "purchases": [{"title": p.get("title", "Course"), "link": p.get("link", "#")} for p in user_purchases]
-        })
-    return jsonify(out)
+        else: query = {"username": {"$regex": re.escape(search_q), "$options": "i"}}
+    users = list(users_col.find(query).sort("updated_at", -1).limit(200))
+    uids = [u.get("user_id") for u in users]
+    purchases = list(purchases_col.find({"user_id": {"$in": uids}}).sort("_id", 1))
+    rows = _purchase_rows(purchases)
+    by_uid = {}
+    for p, row in zip(purchases, rows):
+        by_uid.setdefault(p.get("user_id"), []).append(row)
+    return jsonify([{
+        "user_id": u.get("user_id"),
+        "username": u.get("username", "None"),
+        "updated_at": u.get("updated_at"),
+        "purchases": by_uid.get(u.get("user_id"), []),
+    } for u in users])
 
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Store Dashboard</title>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Store">
+<link rel="manifest" href="/dashboard/manifest.json">
+<link rel="icon" href="/dashboard/icon.svg" type="image/svg+xml">
+<title>Store Dashboard</title>
 <style>
-  :root{--bg:#0F1512; --surface:#141C18; --line:#26332C; --text:#EDF2EF; --muted:#8FA398; --ok:#3ED9A0; --pending:#E8A94A; --danger:#E8695F;}
-  *{box-sizing:border-box;} body{margin:0; background:var(--bg); color:var(--text); font-family:sans-serif; font-size:14px;}
-  .mono{font-family:monospace;}
-  header{padding:15px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between;}
-  .ledger{display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:10px; padding:15px;}
-  .ledger .row{background:var(--surface); padding:15px; border-radius:6px; border:1px solid var(--line);}
-  .tabs{display:flex; gap:15px; padding:10px 15px; border-bottom:1px solid var(--line); overflow-x:auto;}
-  .tab{color:var(--muted); cursor:pointer; padding-bottom:5px; border-bottom:2px solid transparent; white-space:nowrap;}
-  .tab.active{color:var(--text); border-bottom-color:var(--ok);}
-  .subtabs{display:flex; gap:10px; padding:10px 15px;}
-  .subtab{color:var(--muted); padding:4px 10px; border:1px solid var(--line); border-radius:15px; cursor:pointer;}
-  .subtab.active{background:var(--ok); color:var(--bg); border-color:var(--ok);}
-  .list{padding:15px; padding-bottom:50px;}
-  .item{display:flex; justify-content:space-between; align-items:center; background:var(--surface); padding:10px; margin-bottom:8px; border-left:3px solid var(--line); border-radius:4px;}
-  .item.ok{border-color:var(--ok);} .item.pending{border-color:var(--pending);} .item.expired{border-color:var(--danger);}
-  .item .main{flex:1;} .item .name{font-weight:bold;} .item .sub{color:var(--muted); font-size:12px; margin-top:3px;}
-  .item .amt{font-size:15px; font-weight:bold;} 
-  .action-btn{background:var(--surface); color:var(--text); border:1px solid var(--line); padding:6px 10px; border-radius:4px; cursor:pointer; font-size:12px; margin-top:6px; display:inline-block; margin-left:4px;}
-  .ok-btn{border-color:var(--ok); color:var(--ok);} .danger-btn{border-color:var(--danger); color:var(--danger);}
-  .form-box{background:var(--surface); padding:15px; border-radius:6px; border:1px solid var(--line); margin-bottom:15px;}
-  .form-box input, .form-box select, .form-box textarea{width:100%; padding:8px; margin:5px 0 10px; background:var(--bg); border:1px solid var(--line); color:var(--text); border-radius:4px;}
-  .form-box button{background:var(--ok); color:var(--bg); border:none; padding:10px 15px; border-radius:4px; font-weight:bold; cursor:pointer;}
-  .switch { position: relative; display: inline-block; width: 50px; height: 24px; vertical-align: middle; margin-left:10px;}
-  .switch input { opacity: 0; width: 0; height: 0; }
-  .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: var(--line); transition: .4s; border-radius: 24px; }
-  .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
-  input:checked + .slider { background-color: var(--danger); }
-  input:checked + .slider:before { transform: translateX(26px); }
-  .checkbox-lbl { display: block; margin-top: 8px; color: var(--text); cursor: pointer;}
-</style></head><body>
-<header><h2>Store Dashboard</h2><div id="clock" class="mono"></div></header>
-<div class="ledger" id="overview"></div>
-<div class="tabs">
-  <div class="tab active" data-tab="orders">Orders</div>
-  <div class="tab" data-tab="courses">Courses</div>
-  <div class="tab" data-tab="offers">Offers</div>
-  <div class="tab" data-tab="logs">Channel Logs</div>
-  <div class="tab" data-tab="sms">SMS Pool & Trigger</div>
-  <div class="tab" data-tab="broadcast">📢 Broadcast</div>
-  <div class="tab" data-tab="users">Users</div>
-  <div class="tab" data-tab="settings">⚙️ Settings</div>
+:root{
+  --bg:#000000; --surface:#0a0a0a; --surface-2:#111111; --surface-3:#171717;
+  --line:#1f1f1f; --line-2:#2a2a2a;
+  --text:#f2f2f2; --muted:#8a8a8a; --dim:#5c5c5c;
+  --ok:#4ade80; --warn:#fbbf24; --bad:#f87171;
+  --radius:14px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--bg)}
+body{color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+input,select,textarea{background:var(--bg);border:1px solid var(--line-2);border-radius:10px;padding:10px 12px;width:100%;outline:none;transition:border-color .15s}
+input:focus,select:focus,textarea:focus{border-color:#4a4a4a}
+textarea{min-height:110px;resize:vertical}
+input[type=checkbox]{width:18px;height:18px;accent-color:#fff;flex:none}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+.muted{color:var(--muted)}
+.dim{color:var(--dim)}
+a{color:var(--text);text-decoration:underline;text-underline-offset:3px;text-decoration-color:#444}
+
+/* ---------- top bar ---------- */
+.topbar{position:fixed;top:0;left:0;right:0;height:60px;display:flex;align-items:center;gap:12px;padding:0 16px;background:#000;border-bottom:1px solid var(--line);z-index:20}
+.icon-btn{width:38px;height:38px;border-radius:10px;border:1px solid var(--line-2);background:transparent;display:grid;place-items:center;flex:none;transition:background .15s}
+.icon-btn:hover{background:var(--surface-2)}
+.icon-btn svg{width:18px;height:18px;stroke:var(--text);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.brand{font-weight:600;font-size:15px;letter-spacing:.01em;white-space:nowrap}
+.search{flex:1;display:flex;gap:8px;max-width:560px;margin:0 auto}
+.search input{padding:9px 14px;border-radius:999px;background:var(--surface);font-size:13.5px}
+.search input::placeholder{color:var(--dim)}
+.search button{padding:0 16px;border-radius:999px;border:1px solid var(--line-2);background:var(--text);color:#000;font-weight:600;font-size:13px;white-space:nowrap}
+.avatar{width:36px;height:36px;border-radius:50%;background:var(--surface-3);border:1px solid var(--line-2);display:grid;place-items:center;font-weight:600;font-size:13px;flex:none}
+.menu{position:fixed;right:14px;top:68px;background:var(--surface);border:1px solid var(--line-2);border-radius:12px;min-width:200px;padding:6px;display:none;box-shadow:0 20px 40px rgba(0,0,0,.8);z-index:25}
+.menu.open{display:block}
+.menu button{display:flex;align-items:center;gap:10px;width:100%;padding:10px 12px;border:none;background:none;border-radius:8px;text-align:left;font-size:13.5px}
+.menu button:hover{background:var(--surface-2)}
+.menu hr{border:none;border-top:1px solid var(--line);margin:6px 4px}
+
+/* ---------- side panel ---------- */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);opacity:0;pointer-events:none;transition:opacity .25s;z-index:30}
+.overlay.show{opacity:1;pointer-events:auto}
+.drawer{position:fixed;top:0;bottom:0;left:0;width:260px;max-width:84vw;background:#000;border-right:1px solid var(--line);transform:translateX(-102%);transition:transform .28s cubic-bezier(.2,.8,.2,1);z-index:40;padding:18px 10px;overflow-y:auto}
+.drawer.open{transform:translateX(0)}
+.drawer .head{display:flex;align-items:center;gap:10px;padding:4px 10px 14px}
+.drawer .head .logo{width:34px;height:34px;border-radius:10px;background:var(--text);color:#000;display:grid;place-items:center;font-weight:700}
+.nav-title{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);padding:16px 12px 6px}
+.nav-item{display:flex;align-items:center;gap:10px;width:100%;padding:9px 12px;border:none;background:none;border-radius:9px;text-align:left;color:var(--muted);font-size:13.5px;transition:background .12s,color .12s}
+.nav-item svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.nav-item:hover{background:var(--surface-2);color:var(--text)}
+.nav-item.active{background:var(--surface-3);color:var(--text);font-weight:600}
+
+/* ---------- content ---------- */
+main{padding:84px 18px 56px;max-width:1040px;margin:0 auto}
+.page-head{margin-bottom:18px}
+.page-head h1{font-size:20px;font-weight:600;margin:0;letter-spacing:-.01em}
+.page-head p{margin:4px 0 0;color:var(--muted);font-size:13px}
+.note{border:1px solid var(--line);border-radius:12px;padding:12px 14px;color:var(--muted);font-size:13px;margin-bottom:16px;background:var(--surface)}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:16px}
+.card h3{margin:0 0 4px;font-size:14px;font-weight:600}
+.card .sub-h{margin:0 0 14px;color:var(--muted);font-size:12.5px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:18px}
+.stat{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:16px;cursor:pointer;transition:border-color .15s,background .15s}
+.stat:hover{border-color:var(--line-2);background:var(--surface-2)}
+.stat .k{color:var(--muted);font-size:12px}
+.stat .v{font-size:24px;font-weight:600;margin-top:6px;letter-spacing:-.02em}
+
+/* list rows */
+.row{display:flex;align-items:center;gap:14px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-bottom:8px;transition:opacity .2s,border-color .15s}
+.row:hover{border-color:var(--line-2)}
+.row .grow{flex:1;min-width:0}
+.row .title{font-weight:600;overflow-wrap:anywhere}
+.row .meta{color:var(--muted);font-size:12.5px;margin-top:3px;overflow-wrap:anywhere}
+.row .right{display:flex;flex-direction:column;align-items:flex-end;gap:8px;flex:none}
+.row .end{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.amount{font-weight:600;font-size:15px;font-variant-numeric:tabular-nums}
+.row.state-pending{box-shadow:inset 2px 0 0 var(--warn)}
+.row.state-ok{box-shadow:inset 2px 0 0 var(--ok)}
+.row.state-bad{box-shadow:inset 2px 0 0 var(--bad)}
+.row.removing{opacity:.3;pointer-events:none}
+
+.pill{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;font-size:11.5px;border:1px solid var(--line-2);color:var(--muted);white-space:nowrap}
+.pill.ok{color:var(--ok);border-color:rgba(74,222,128,.25)}
+.pill.warn{color:var(--warn);border-color:rgba(251,191,36,.25)}
+.pill.bad{color:var(--bad);border-color:rgba(248,113,113,.25)}
+.pill.solid{background:var(--text);color:#000;border-color:var(--text)}
+.pill.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px}
+
+/* buttons */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 13px;border-radius:9px;border:1px solid var(--line-2);background:var(--surface-2);font-weight:500;font-size:13px;white-space:nowrap;transition:background .12s,border-color .12s,opacity .12s}
+.btn:hover{background:var(--surface-3)}
+.btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.btn.sm{padding:6px 10px;font-size:12px;border-radius:8px}
+.btn.primary{background:var(--text);color:#000;border-color:var(--text)}
+.btn.primary:hover{background:#d9d9d9}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--muted)}
+.btn.ghost:hover{color:var(--text);background:var(--surface-2)}
+.btn.danger{color:#fca5a5;background:rgba(248,113,113,.06);border-color:rgba(248,113,113,.22)}
+.btn.danger:hover{background:rgba(248,113,113,.14);border-color:rgba(248,113,113,.4)}
+.btn.success{color:#86efac;background:rgba(74,222,128,.06);border-color:rgba(74,222,128,.22)}
+.btn.success:hover{background:rgba(74,222,128,.14);border-color:rgba(74,222,128,.4)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+
+/* segmented filter */
+.seg{display:inline-flex;gap:4px;padding:4px;background:var(--surface);border:1px solid var(--line);border-radius:11px;margin-bottom:16px;flex-wrap:wrap}
+.seg button{padding:6px 14px;border-radius:8px;border:none;background:none;color:var(--muted);font-size:13px}
+.seg button:hover{color:var(--text)}
+.seg button.active{background:var(--surface-3);color:var(--text);font-weight:600}
+
+/* forms */
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;align-items:end}
+.field label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+.field .hint{font-size:11.5px;color:var(--dim);margin-top:5px}
+.toggle-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 0;border-bottom:1px solid var(--line)}
+.toggle-row:last-child{border-bottom:none}
+.toggle-row .lbl{font-size:13.5px}
+.toggle-row .lbl small{display:block;color:var(--muted);font-size:12px;margin-top:2px}
+
+/* user / purchase cards */
+.user{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:16px;margin-bottom:12px}
+.user-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.user-head .name{font-weight:600}
+.purch{display:flex;align-items:center;gap:12px;padding:11px 12px;border:1px solid var(--line);border-radius:10px;margin-top:8px;background:#000}
+.purch .grow{flex:1;min-width:0}
+.purch .t{font-weight:500;overflow-wrap:anywhere}
+.purch .m{margin-top:5px;display:flex;flex-wrap:wrap;gap:6px}
+.empty{text-align:center;color:var(--muted);padding:36px 12px;border:1px dashed var(--line);border-radius:12px;font-size:13px}
+.spinner{display:inline-block;width:15px;height:15px;border:2px solid var(--line-2);border-top-color:var(--text);border-radius:50%;animation:spin .7s linear infinite;vertical-align:-3px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* modal + confirm */
+.modal-wrap{position:fixed;inset:0;background:rgba(0,0,0,.75);display:none;align-items:center;justify-content:center;padding:18px;z-index:50}
+.modal-wrap.open{display:flex}
+.modal{background:var(--surface);border:1px solid var(--line-2);border-radius:18px;width:100%;max-width:560px;max-height:86vh;display:flex;flex-direction:column;animation:pop .18s ease-out}
+.modal.small{max-width:400px}
+@keyframes pop{from{transform:scale(.97);opacity:0}to{transform:none;opacity:1}}
+.modal-head{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:16px 18px;border-bottom:1px solid var(--line)}
+.modal-head b{font-weight:600}
+.modal-body{padding:18px;overflow-y:auto}
+.modal-foot{display:flex;justify-content:flex-end;gap:8px;padding:14px 18px;border-top:1px solid var(--line)}
+.confirm-icon{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;margin-bottom:12px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.22)}
+.confirm-icon svg{width:18px;height:18px;stroke:#fca5a5;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+.confirm-title{font-weight:600;font-size:15px;margin-bottom:6px}
+.confirm-text{color:var(--muted);font-size:13px}
+
+/* toast */
+.toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,16px);background:var(--surface-3);border:1px solid var(--line-2);color:var(--text);padding:10px 16px;border-radius:12px;opacity:0;transition:.22s;z-index:60;max-width:90vw;font-size:13px;box-shadow:0 10px 30px rgba(0,0,0,.6);pointer-events:none}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+.toast.err{border-color:rgba(248,113,113,.35);color:#fecaca}
+
+@media (max-width:640px){
+  .brand{display:none}
+  .topbar{gap:8px;padding:0 10px}
+  .search button{padding:0 12px}
+  #clock{display:none}
+  main{padding:76px 12px 48px}
+  .row{flex-direction:column;align-items:stretch}
+  .row .right{align-items:flex-start}
+  .row .end{justify-content:flex-start}
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <button class="icon-btn" id="btn-menu" title="Menu" aria-label="Open menu">
+    <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+  </button>
+  <div class="brand">Store</div>
+  <form class="search" id="search-form" autocomplete="off">
+    <input id="q" type="text" placeholder="Search user by ID or username, press Enter" inputmode="search">
+    <button type="submit">Search</button>
+  </form>
+  <div class="mono dim" id="clock"></div>
+  <button class="avatar" id="btn-avatar" title="Account" aria-label="Account">A</button>
+</header>
+
+<div class="menu" id="profile-menu">
+  <button data-act="open-admins">Admins</button>
+  <button data-act="refresh">Refresh</button>
+  <hr>
+  <button data-act="close-menu">Close</button>
 </div>
-<div class="subtabs" id="subtabs">
-  <div class="subtab active" data-status="all">All</div>
-  <div class="subtab" data-status="pending">Pending</div>
-  <div class="subtab" data-status="completed">Completed</div>
-  <div class="subtab" data-status="expired">Expired</div>
+
+<div class="overlay" id="overlay"></div>
+<aside class="drawer" id="drawer">
+  <div class="head">
+    <div class="logo">S</div>
+    <div><b>Store Dashboard</b><div class="muted" style="font-size:12px">Admin panel</div></div>
+  </div>
+  <div id="nav"></div>
+</aside>
+
+<main>
+  <div class="page-head"><h1 id="page-title">Dashboard</h1><p id="page-sub"></p></div>
+  <div id="body"></div>
+</main>
+
+<div class="modal-wrap" id="modal">
+  <div class="modal" id="modal-box">
+    <div class="modal-head"><b id="modal-title"></b><button class="icon-btn" data-act="close-modal" aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-foot" id="modal-foot" style="display:none"></div>
+  </div>
 </div>
-<div class="list" id="list">Loading...</div>
+
 <script>
-let curTab="orders", curSt="all", searchUserQ="";
-function fmtSecs(s){ if(s<=0)return "0s"; let m=Math.floor(s/60), sec=s%60; return m+"m "+sec+"s"; }
-async function load(){
-  let r=await fetch("/dashboard/api/overview"), d=await r.json();
-  document.getElementById("overview").innerHTML=`
-    <div class="row">Today: <br><b class="mono" style="font-size:18px">₹${d.today_amount}</b></div>
-    <div class="row">Active QR: <b>${d.active_pending}</b><br>Pending SMS: <b>${d.pending_sms}</b></div>
-    <div class="row">Total Sales: <b>${d.completed_total}</b><br>Total Users: <b>${d.total_users}</b></div>
-  `;
-  if(curTab==="orders"){
-    r=await fetch("/dashboard/api/orders?status="+curSt); let o=await r.json();
-    document.getElementById("list").innerHTML = o.map(x=>{
-      let c=x.status==="PENDING"?"pending":x.status==="EXPIRED"?"expired":"ok";
-      let rgt = x.status==="PENDING"?`<div class="timer mono" data-remain="${x.remaining_seconds}">${fmtSecs(x.remaining_seconds)} bacha</div>`:`<div class="sub">${x.method||x.status}</div>`;
-      let actions = "";
-      if(x.status==="PENDING" || x.status==="EXPIRED"){
-        actions = `<br><button class="action-btn ok-btn" onclick="appr('${x.order_id}')">✅ Force Approve</button><button class="action-btn danger-btn" onclick="canO('${x.order_id}')">❌ Cancel</button>`;
-      }
-      return `<div class="item ${c}"><div class="main"><div class="name">${x.user} · <span class="mono">${x.course_id}</span></div><div class="sub">${x.order_id} · ${x.created_at}</div></div><div style="text-align:right"><div class="amt mono">₹${x.amount}</div>${rgt}${actions}</div></div>`;
-    }).join("")||"No orders.";
-  } else if(curTab==="courses"){
-    r=await fetch("/dashboard/api/courses"); let o=await r.json();
-    document.getElementById("list").innerHTML = o.map(x=>`<div class="item ok" style="cursor:pointer" onclick="viewBuyers('${x.course_id}')"><div class="main"><div class="name"><span class="mono">${x.course_id}</span> - ${x.title||'No Title'} ${x.is_channel?'📢 Channel':'📝 Text'}</div><div class="sub">₹${x.amount} · ${x.caption}</div></div><div><button class="action-btn danger-btn" onclick="event.stopPropagation(); delC('${x.course_id}')">🗑 Delete</button></div></div>`).join("")||"No courses.";
-  } else if(curTab==="offers"){
-    r=await fetch("/dashboard/api/offers"); let o=await r.json();
-    let formHTML = `<div class="form-box"><h3>Create New Offer</h3>
-      <label>Discount %:</label><input type="number" id="off_disc" value="50">
-      <label>Target:</label><select id="off_tgt" onchange="document.getElementById('off_cid').style.display=this.value=='single'?'block':'none'"><option value="all">All Courses</option><option value="single">Single Course</option></select>
-      <input type="text" id="off_cid" placeholder="Course ID (e.g. c_12345)" style="display:none">
-      <label>Max Users (0 for unlimited):</label><input type="number" id="off_max" value="0">
-      <label>Per User Limit (1 = one-time only per user, 0 = unlimited):</label><input type="number" id="off_peruser" value="1">
-      <label>Active Hours:</label><input type="number" id="off_hrs" value="24">
-      <button onclick="createOffer()">Create Offer</button></div>`;
-    let listHTML = o.map(x=>`<div class="item ${x.status==='Active'?'ok':'expired'}"><div class="main"><div class="name">${x.discount}% OFF - <span class="mono">${x.offer_code}</span></div><div class="sub">🔗 Link: <a href="${x.link}" target="_blank" style="color:#3ED9A0">${x.link}</a></div><div class="sub">Target: ${x.target} ${x.course?'('+x.course+')':''} | Used: ${x.used}/${x.max==-1?'∞':x.max} | Per User: ${x.per_user==-1?'∞':x.per_user+'x'} | Exp: ${x.expires}</div></div><div><button class="action-btn danger-btn" onclick="delOffer('${x.offer_code}')">🗑</button></div></div>`).join("");
-    document.getElementById("list").innerHTML = formHTML + (listHTML||"No offers.");
-  } else if(curTab==="logs"){
-    r=await fetch("/dashboard/api/channel-logs"); let o=await r.json();
-    document.getElementById("list").innerHTML = o.map(x=>`<div class="item ${x.status==='APPROVED'?'ok':'expired'}"><div class="main"><div class="name">${x.first_name} (@${x.username}) - <span class="mono">${x.user_id}</span></div><div class="sub">📺 Channel: <b style="color:var(--text)">${x.channel_name}</b></div><div class="sub">Pack: ${x.course} · ${x.date}</div></div><div style="font-weight:bold; color:var(--${x.status==='APPROVED'?'ok':'danger'})">${x.status}</div></div>`).join("")||"No logs yet.";
-  } else if(curTab==="sms"){
-    r=await fetch("/dashboard/api/sms-pool"); let o=await r.json();
-    let injectHTML = `
-      <div class="form-box">
-        <h3>🚀 Manual SMS / Payment Injector</h3>
-        <p style="font-size:12px; color:var(--muted)">अगर बैंक का SMS नहीं आया, तो यहाँ बस अमाउंट डालें (जैसे <code>50.01</code>) और ट्रिगर दबाएं। बोट खुद पेमेंट को मैच करके डिलीवरी कर देगा।</p>
-        <div style="display:flex; gap:10px;">
-          <input type="text" id="inject_amt" placeholder="Amount (e.g. 50.01)" style="flex:1;">
-          <button onclick="injectSMS()" style="padding:0 20px;">🚀 Trigger Webhook</button>
-        </div>
-      </div>
-    `;
-    let listHTML = o.map(x=>`<div class="item pending"><div class="main"><div class="name">₹${x.amount}</div><div class="sub mono">${x.preview}</div></div><div><div class="sub">${x.created_at}</div></div></div>`).join("")||"No SMS in pool.";
-    document.getElementById("list").innerHTML = injectHTML + listHTML;
-  } else if(curTab==="broadcast") {
-    document.getElementById("list").innerHTML = `
-      <div class="form-box">
-        <h3>📢 Send Global Broadcast</h3>
-        <p style="font-size:12px; color:var(--muted)">यहाँ से सभी बोट यूज़र्स को सीधा मैसेज भेजें।</p>
-        <textarea id="bc_msg" rows="5" placeholder="HTML मैसेज टाइप करें (जैसे <b>Hello Users</b>)..."></textarea>
-        <button onclick="sendDashboardBroadcast()">🚀 Send Broadcast to All</button>
-      </div>
-    `;
-  } else if(curTab==="settings") {
-    r=await fetch("/dashboard/api/system-settings"); let cfg=await r.json();
-    document.getElementById("list").innerHTML = `
-      <div class="form-box">
-        <h3>🛑 Maintenance Mode</h3>
-        <div style="margin-bottom: 20px;">
-          <span style="font-weight:bold;">Maintenance Mode:</span>
-          <label class="switch">
-            <input type="checkbox" id="maint_toggle" ${cfg.maintenance ? 'checked' : ''} onchange="saveSettings()">
-            <span class="slider"></span>
-          </label>
-        </div>
-        
-        <hr style="border-color:var(--line); margin: 20px 0;">
-        <h3>⏱️ Content Auto-Delete Timer</h3>
-        <p style="font-size:12px; color:var(--muted)">जब भी यूज़र किसी कोर्स, बैच या फाइल लिंक पर क्लिक करेगा, तो जो कंटेंट उसे शो होगा, वह इतने टाइम के बाद अपने आप डिलीट हो जाएगा।</p>
-        <label>Course/File Auto-Delete Timer:</label>
-        <select id="course_timer_minutes" onchange="saveSettings()">
-            <option value="0" ${cfg.course_timer_minutes==0?'selected':''}>Disabled (Off)</option>
-            <option value="5" ${cfg.course_timer_minutes==5?'selected':''}>5 Minutes</option>
-            <option value="10" ${cfg.course_timer_minutes==10?'selected':''}>10 Minutes</option>
-            <option value="20" ${cfg.course_timer_minutes==20?'selected':''}>20 Minutes</option>
-            <option value="30" ${cfg.course_timer_minutes==30?'selected':''}>30 Minutes</option>
-        </select>
+/* ============ helpers ============ */
+const $ = s => document.querySelector(s);
+const enc = encodeURIComponent;
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const money = v => "₹" + (v ?? 0);
+const empty = msg => `<div class="empty">${esc(msg)}</div>`;
+const fmtSecs = s => { s = Math.max(0, +s || 0); return Math.floor(s / 60) + "m " + String(s % 60).padStart(2, "0") + "s"; };
+const ICON = {
+  trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
+  x: '<path d="M6 6l12 12M18 6L6 18"/>',
+  check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+  alert: '<path d="M12 8v5M12 16.5v.5M10.3 3.9L2.6 17.2A2 2 0 004.3 20h15.4a2 2 0 001.7-2.8L13.7 3.9a2 2 0 00-3.4 0z"/>',
+  link: '<path d="M10 14a4 4 0 005.7 0l3-3a4 4 0 00-5.7-5.7l-1 1M14 10a4 4 0 00-5.7 0l-3 3a4 4 0 005.7 5.7l1-1"/>',
+  users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.6-3.4 3.2-5.5 6.5-5.5s5.9 2.1 6.5 5.5M16 4.5a3.5 3.5 0 010 7M18.5 14.8c1.7.7 2.8 2.6 3 5.2"/>',
+};
+const svg = (name, cls = "") => `<svg viewBox="0 0 24 24" class="${cls}">${ICON[name]}</svg>`;
 
-        <hr style="border-color:var(--line); margin: 20px 0;">
-        <h3>🧹 General Auto Chat-Delete (Inactivity)</h3>
-        <label>Auto-Clear Inactive Chat Timer:</label>
-        <select id="cleanup_time" onchange="saveSettings()">
-            <option value="0" ${cfg.cleanup_seconds==0?'selected':''}>Disabled (Off)</option>
-            <option value="3600" ${cfg.cleanup_seconds==3600?'selected':''}>1 Hour</option>
-            <option value="43200" ${cfg.cleanup_seconds==43200?'selected':''}>12 Hours</option>
-            <option value="86400" ${cfg.cleanup_seconds==86400?'selected':''}>24 Hours</option>
-            <option value="172800" ${cfg.cleanup_seconds==172800?'selected':''}>48 Hours</option>
-        </select>
-        <label class="checkbox-lbl"><input type="checkbox" id="auto_del_promos" ${cfg.auto_del_promos?'checked':''} onchange="saveSettings()"> 🗑️ Auto-Delete Promos, Menus</label>
-        <label class="checkbox-lbl"><input type="checkbox" id="auto_del_broadcasts" ${cfg.auto_del_broadcasts?'checked':''} onchange="saveSettings()"> 🗑️ Auto-Delete Broadcast Messages</label>
-        <label class="checkbox-lbl"><input type="checkbox" id="auto_del_purchases" ${cfg.auto_del_purchases?'checked':''} onchange="saveSettings()"> <span style="color:var(--danger)">⚠️ Auto-Delete Purchased Links</span></label>
-        
-        <hr style="border-color:var(--line); margin: 20px 0;">
-        <button style="background-color:var(--danger);" onclick="forceClearChats()">🧹 Clear Selected Chats Now</button>
-      </div>
-    `;
-  } else {
-    r=await fetch("/dashboard/api/users?search="+encodeURIComponent(searchUserQ)); let o=await r.json();
-    let searchBox = `<div class="form-box"><h3>🔍 Search User</h3><div style="display:flex; gap:10px;"><input type="text" id="user_search_input" placeholder="Search by Username or User ID..." value="${searchUserQ}"><button onclick="searchUserQ=document.getElementById('user_search_input').value; load();" style="padding:0 20px;">Search</button><button onclick="searchUserQ=''; load();" style="background:var(--danger); padding:0 15px;">Reset</button></div></div>`;
-    let usersList = o.map(x=>{
-      let purchasesHTML = x.purchases.length > 0 ? x.purchases.map(p=>`<li><b>${p.title}</b> - <a href="${p.link}" target="_blank" style="color:var(--ok)">Link</a></li>`).join("") : "<span style='color:var(--muted)'>No purchases</span>";
-      return `<div class="item ok" style="flex-direction:column; align-items:flex-start;"><div style="width:100%; display:flex; justify-content:space-between;"><div><b>User ID:</b> <span class="mono">${x.user_id}</span> | <b>Username:</b> @${x.username}</div><div class="sub">Active: ${x.updated_at}</div></div><div style="margin-top:8px; width:100%; background:var(--bg); padding:8px; border-radius:4px;"><ul style="margin:0; padding-left:15px; font-size:12px;">${purchasesHTML}</ul></div></div>`;
-    }).join("")||"No users found.";
-    document.getElementById("list").innerHTML = searchBox + usersList;
+function toast(msg, type = "ok"){
+  const t = document.createElement("div");
+  t.className = "toast" + (type === "err" ? " err" : "");
+  t.textContent = msg;
+  document.body.appendChild(t);
+  requestAnimationFrame(() => t.classList.add("show"));
+  setTimeout(() => { t.classList.remove("show"); setTimeout(() => t.remove(), 250); }, 2600);
+}
+
+async function api(path, opts = {}){
+  const o = Object.assign({headers: {"Content-Type": "application/json"}}, opts);
+  if(o.body && typeof o.body !== "string") o.body = JSON.stringify(o.body);
+  const r = await fetch(path, o);
+  let d = {};
+  try { d = await r.json(); } catch(e) {}
+  if(!r.ok) throw new Error(d.error || ("Request failed (" + r.status + ")"));
+  return d;
+}
+
+/* ============ confirm popup (replaces browser confirm) ============ */
+function confirmBox({title, text, okText = "Confirm", danger = true}){
+  return new Promise(resolve => {
+    openModal("", `
+      <div class="confirm-icon">${danger ? svg("alert") : svg("check")}</div>
+      <div class="confirm-title">${esc(title)}</div>
+      <div class="confirm-text">${esc(text)}</div>`, {small: true, foot: `
+      <button class="btn ghost" data-act="cancel-confirm">Cancel</button>
+      <button class="btn ${danger ? "danger" : "primary"}" data-act="ok-confirm">${esc(okText)}</button>`});
+    pendingConfirm = resolve;
+  });
+}
+let pendingConfirm = null;
+function settleConfirm(v){
+  if(pendingConfirm){ const r = pendingConfirm; pendingConfirm = null; r(v); }
+  closeModal();
+}
+
+/* ============ navigation ============ */
+const NAV = [
+  ["Overview", [["home", "Dashboard", "users"]]],
+  ["Sales", [["orders", "Orders", "check"], ["users", "Users & purchases", "users"]]],
+  ["Store", [["courses", "Courses", "check"], ["offers", "Offers", "check"], ["logs", "Channel logs", "check"]]],
+  ["Messaging", [["broadcast", "Broadcast", "check"], ["sms", "SMS pool & trigger", "check"]]],
+  ["System", [["settings", "Bot settings", "check"]]],
+];
+const TITLES = {home: "Dashboard", orders: "Orders", users: "Users & purchases", courses: "Courses", offers: "Offers",
+  logs: "Channel logs", broadcast: "Broadcast", sms: "SMS pool & trigger", settings: "Bot settings", search: "Search"};
+const SUBS = {home: "Overview of today's store activity.", orders: "Approve or cancel payment requests.",
+  users: "Every user and the courses they bought.", courses: "Browse, inspect and remove packs.",
+  offers: "Discount links for customers.", logs: "Channel join requests.", broadcast: "Message all users, and remove sent messages.",
+  sms: "Bank SMS pool and manual payment trigger.", settings: "Maintenance and auto-clean options."};
+
+function buildNav(){
+  $("#nav").innerHTML = NAV.map(([g, items]) =>
+    `<div class="nav-title">${g}</div>` +
+    items.map(([k, label]) => `<button class="nav-item" data-view="${k}">${label}</button>`).join("")
+  ).join("");
+}
+function highlightNav(v){
+  document.querySelectorAll(".nav-item").forEach(n => n.classList.toggle("active", n.dataset.view === v));
+}
+
+/* ============ screen templates ============ */
+const SHELL = {
+  home: () => `<div class="note">Search any user from the top bar to see their full purchase history.</div><div id="list"></div>`,
+  orders: () => `<div class="seg">${[["all","All"],["pending","Pending"],["completed","Completed"],["expired","Expired"]]
+      .map(([k, l]) => `<button data-of="${k}" class="${k === orderFilter ? "active" : ""}">${l}</button>`).join("")}</div><div id="list"></div>`,
+  users: () => `<div class="note">Recent users and their courses. Use the search bar to find a specific user.</div><div id="list"></div>`,
+  courses: () => `<div class="note">Create new packs from the bot's Admin Panel (Packs & Batches). You can view and remove them here.</div><div id="list"></div>`,
+  offers: () => `<div class="card"><h3>Create offer</h3><p class="sub-h">Generates a discount link you can share.</p>
+    <div class="form-grid">
+      <div class="field"><label>Discount (%)</label><input id="off-disc" type="number" value="50"></div>
+      <div class="field"><label>Applies to</label><select id="off-tgt"><option value="all">All courses</option><option value="single">One course</option></select></div>
+      <div class="field"><label>Course ID (one course only)</label><input id="off-cid" placeholder="c_12345"></div>
+      <div class="field"><label>Max users (0 = unlimited)</label><input id="off-max" type="number" value="0"></div>
+      <div class="field"><label>Times per user (0 = unlimited)</label><input id="off-peruser" type="number" value="1"></div>
+      <div class="field"><label>Valid for (hours)</label><input id="off-hrs" type="number" value="24"></div>
+      <div><button class="btn primary" data-act="create-offer">Create offer</button></div>
+    </div></div><div id="list"></div>`,
+  logs: () => `<div id="list"></div>`,
+  broadcast: () => `<div class="card"><h3>New broadcast</h3><p class="sub-h">Sent to every user. HTML tags like &lt;b&gt; are supported.</p>
+    <textarea id="bc-msg" placeholder="Write your message…"></textarea>
+    <div style="margin-top:12px;display:flex;justify-content:flex-end"><button class="btn primary" data-act="send-broadcast">Send to all users</button></div></div>
+    <div class="card"><h3>Sent broadcasts</h3><p class="sub-h">Remove a broadcast from every user's chat. Telegram only allows deleting messages sent within the last 48 hours.</p><div id="list"></div></div>`,
+  sms: () => `<div class="card"><h3>Manual payment trigger</h3><p class="sub-h">If a bank SMS did not arrive, enter the exact amount (for example 50.01) and trigger it.</p>
+    <div class="form-grid"><div class="field"><label>Amount</label><input id="inj-amt" placeholder="50.01" inputmode="decimal"></div>
+    <div><button class="btn primary" data-act="inject">Trigger</button></div></div></div><div id="list"></div>`,
+  settings: () => `<div id="list"></div>`,
+};
+
+/* ============ data ============ */
+let view = "home", orderFilter = "all", lastQuery = "";
+const cache = {};
+const cacheKey = (v = view) => v === "orders" ? "orders-" + orderFilter : v;
+
+const FETCH = {
+  home: () => api("/dashboard/api/overview"),
+  orders: () => api("/dashboard/api/orders?status=" + orderFilter),
+  users: () => api("/dashboard/api/users"),
+  courses: () => api("/dashboard/api/courses"),
+  offers: () => api("/dashboard/api/offers"),
+  logs: () => api("/dashboard/api/channel-logs"),
+  broadcast: () => api("/dashboard/api/broadcasts"),
+  sms: () => api("/dashboard/api/sms-pool"),
+  settings: () => api("/dashboard/api/system-settings"),
+};
+
+function setListLoading(){
+  const l = $("#list");
+  if(l) l.innerHTML = `<div class="empty"><span class="spinner"></span></div>`;
+}
+
+// Show cached data instantly, then refresh quietly in the background.
+async function loadView(quiet = false){
+  const v = view, key = cacheKey(v);
+  if(cache[key] !== undefined) RENDER[v](cache[key]);
+  else if(!quiet) setListLoading();
+  try{
+    const data = await FETCH[v]();
+    if(view !== v || cacheKey(v) !== key) return;
+    cache[key] = data;
+    RENDER[v](data);
+  }catch(e){
+    if(!quiet) toast(e.message, "err");
   }
 }
 
-async function injectSMS(){
-  let amt = document.getElementById("inject_amt").value.trim();
-  if(!amt) return alert("Amount enter karein!");
-  let res = await fetch("/dashboard/api/inject-sms", {
-    method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({amount: amt})
-  });
-  let d = await res.json();
-  alert("Result: " + d.result);
-  load();
+const statCard = (k, v, target) => `<div class="stat" data-view="${target}"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`;
+
+function purchasesHtml(uid, list){
+  if(!list || !list.length) return `<div class="muted" style="font-size:13px;margin-top:10px">No courses purchased yet.</div>`;
+  return list.map(p => {
+    const ch = p.channel_name ? `<span class="pill">${esc(p.channel_name)}</span>` : `<span class="pill">Text pack</span>`;
+    const link = p.link && p.link.startsWith("http") ? `<a class="btn ghost sm" href="${esc(p.link)}" target="_blank" rel="noopener">Open</a>` : "";
+    return `<div class="purch"><div class="grow">
+        <div class="t">${esc(p.title)}</div>
+        <div class="m">${ch}<span class="pill mono">${esc(p.course_id)}</span>${p.date ? `<span class="pill">${esc(p.date)}</span>` : ""}</div>
+      </div>${link}
+      <button class="btn danger sm" data-act="rm-purchase" data-uid="${esc(uid)}" data-cid="${esc(p.course_id)}">${svg("trash")}Remove</button></div>`;
+  }).join("");
 }
 
-async function sendDashboardBroadcast(){
-  let msg = document.getElementById("bc_msg").value.trim();
-  if(!msg) return alert("Message cannot be empty!");
-  if(confirm("Send broadcast to ALL users?")){
-    await fetch("/dashboard/api/broadcast", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({message: msg})
-    });
-    alert("Broadcast started in background!");
-    document.getElementById("bc_msg").value = "";
+const RENDER = {
+  home: d => {
+    $("#list").innerHTML = `<div class="stats">
+      ${statCard("Today's earnings", money(d.today_amount), "orders")}
+      ${statCard("Pending payments", d.active_pending, "orders")}
+      ${statCard("Unused SMS", d.pending_sms, "sms")}
+      ${statCard("Total sales", d.completed_total, "orders")}
+      ${statCard("Total users", d.total_users, "users")}
+      ${statCard("Expired QR", d.expired_total, "orders")}</div>`;
+  },
+
+  orders: list => {
+    $("#list").innerHTML = list.length ? list.map(x => {
+      const st = x.status === "PENDING" ? "state-pending" : x.status === "EXPIRED" ? "state-bad" : "state-ok";
+      const badge = x.status === "PENDING"
+        ? `<span class="pill warn" data-remain="${esc(x.remaining_seconds)}">${fmtSecs(x.remaining_seconds)} left</span>`
+        : `<span class="pill ${x.status === "EXPIRED" ? "bad" : "ok"}">${esc(x.method || x.status)}</span>`;
+      const acts = (x.status === "PENDING" || x.status === "EXPIRED")
+        ? `<button class="btn success sm" data-act="approve" data-id="${esc(x.order_id)}">${svg("check")}Approve</button>
+           <button class="btn danger sm" data-act="cancel" data-id="${esc(x.order_id)}">${svg("x")}Cancel</button>` : "";
+      return `<div class="row ${st}">
+        <div class="grow"><div class="title">${esc(x.user)} <span class="dim">·</span> <span class="mono muted">${esc(x.course_id)}</span></div>
+          <div class="meta mono">${esc(x.order_id)} · ${esc(x.created_at)}</div></div>
+        <div class="right"><div class="amount">₹${esc(x.amount)}</div><div class="end">${badge}${acts}</div></div></div>`;
+    }).join("") : empty("No orders in this list.");
+  },
+
+  users: list => {
+    $("#list").innerHTML = list.length ? list.map(u => `<div class="user">
+      <div class="user-head"><div><span class="name">@${esc(u.username || "none")}</span> <span class="mono dim">${esc(u.user_id)}</span></div>
+      <span class="pill">${u.purchases.length} course${u.purchases.length === 1 ? "" : "s"}</span></div>
+      ${purchasesHtml(u.user_id, u.purchases)}</div>`).join("") : empty("No users found.");
+  },
+
+  courses: list => {
+    $("#list").innerHTML = list.length ? list.map(c => `<div class="row">
+      <div class="grow"><div class="title">${esc(c.title || "Untitled")}</div>
+        <div class="meta mono">${esc(c.course_id)}${c.caption ? " · " + esc(c.caption) : ""}</div>
+        <div style="margin-top:8px"><span class="pill">${c.is_channel ? esc(c.channel_name || "Channel") : "Text / link"}</span></div></div>
+      <div class="right"><div class="amount">₹${esc(c.amount)}</div>
+        <div class="end">
+          <button class="btn sm" data-act="buyers" data-id="${esc(c.course_id)}" data-title="${esc(c.title || c.course_id)}">${svg("users")}Buyers</button>
+          <button class="btn danger sm" data-act="del-course" data-id="${esc(c.course_id)}">${svg("trash")}Delete</button>
+        </div></div></div>`).join("") : empty("No courses yet.");
+  },
+
+  offers: list => {
+    $("#list").innerHTML = list.length ? list.map(x => `<div class="row ${x.status === "Active" ? "state-ok" : "state-bad"}">
+      <div class="grow"><div class="title">${esc(x.discount)}% off <span class="mono dim">· ${esc(x.offer_code)}</span></div>
+        <div class="meta"><a href="${esc(x.link)}" target="_blank" rel="noopener">${esc(x.link)}</a></div>
+        <div class="meta">Target: ${esc(x.target)}${x.course ? " (" + esc(x.course) + ")" : ""} · Used ${esc(x.used)}/${x.max == -1 ? "∞" : esc(x.max)} · Per user ${x.per_user == -1 ? "∞" : esc(x.per_user)} · Expires ${esc(x.expires)}</div></div>
+      <div class="right"><span class="pill ${x.status === "Active" ? "ok" : "bad"}">${esc(x.status)}</span>
+        <div class="end"><button class="btn danger sm" data-act="del-offer" data-id="${esc(x.offer_code)}">${svg("trash")}Delete</button></div></div></div>`).join("")
+      : empty("No offers yet.");
+  },
+
+  logs: list => {
+    $("#list").innerHTML = list.length ? list.map(x => `<div class="row ${x.status === "APPROVED" ? "state-ok" : "state-bad"}">
+      <div class="grow"><div class="title">${esc(x.first_name)} <span class="muted">@${esc(x.username)}</span></div>
+        <div class="meta mono">${esc(x.user_id)}</div>
+        <div class="meta">${esc(x.channel_name)} · Pack ${esc(x.course)} · ${esc(x.date)}</div></div>
+      <div class="right"><span class="pill ${x.status === "APPROVED" ? "ok" : "bad"}">${esc(x.status)}</span></div></div>`).join("")
+      : empty("No channel logs yet.");
+  },
+
+  broadcast: list => {
+    $("#list").innerHTML = list.length ? list.map(b => {
+      const msg = b.message || "";
+      const state = b.status === "SENDING" ? `<span class="pill warn">Sending</span>`
+        : b.removed ? `<span class="pill bad">Removed</span>` : `<span class="pill ok">Sent</span>`;
+      return `<div class="row">
+        <div class="grow"><div class="title" style="white-space:pre-wrap;font-weight:500">${esc(msg.slice(0, 160))}${msg.length > 160 ? "…" : ""}</div>
+          <div class="meta">${esc(b.created_at)} · ${esc(b.sent_count)} users</div></div>
+        <div class="right">${state}
+          <div class="end"><button class="btn danger sm" data-act="rm-broadcast" data-id="${esc(b.bid)}" ${b.removed || b.status !== "SENT" ? "disabled" : ""}>${svg("trash")}Remove from chats</button></div></div></div>`;
+    }).join("") : empty("No broadcasts sent yet.");
+  },
+
+  sms: list => {
+    $("#list").innerHTML = list.length ? list.map(x => `<div class="row state-pending">
+      <div class="grow"><div class="title">₹${esc(x.amount)}</div><div class="meta mono">${esc(x.preview)}</div></div>
+      <div class="right"><div class="meta">${esc(x.created_at)}</div></div></div>`).join("") : empty("No unused SMS in the pool.");
+  },
+
+  settings: c => {
+    const opt = (cur, list) => list.map(([v, l]) => `<option value="${v}" ${Number(cur) === v ? "selected" : ""}>${l}</option>`).join("");
+    const tgl = (key, label, desc, on) => `<div class="toggle-row"><div class="lbl">${label}<small>${desc}</small></div><input type="checkbox" data-setting="${key}" ${on ? "checked" : ""}></div>`;
+    $("#list").innerHTML = `
+      <div class="card"><h3>Maintenance mode</h3><p class="sub-h">Turn on to pause the bot for customers. Admins can still use it.</p>
+        ${tgl("maintenance", "Maintenance", "Customers see a maintenance message", c.maintenance)}</div>
+      <div class="card"><h3>Course auto-delete</h3><p class="sub-h">Content a customer opens is removed after this time.</p>
+        <div class="field"><select data-setting="course_timer_minutes">${opt(c.course_timer_minutes, [[0,"Off"],[5,"5 minutes"],[10,"10 minutes"],[20,"20 minutes"],[30,"30 minutes"]])}</select></div></div>
+      <div class="card"><h3>Chat auto-clear</h3><p class="sub-h">Clean up chats after a period of inactivity.</p>
+        <div class="field"><select data-setting="cleanup_seconds">${opt(c.cleanup_seconds, [[0,"Off"],[3600,"1 hour"],[43200,"12 hours"],[86400,"24 hours"],[172800,"48 hours"]])}</select></div>
+        <div style="margin-top:12px">
+          ${tgl("auto_del_promos", "Remove promos and menus", "Recommended", c.auto_del_promos)}
+          ${tgl("auto_del_broadcasts", "Remove broadcast messages", "Recommended", c.auto_del_broadcasts)}
+          ${tgl("auto_del_purchases", "Remove purchased links", "Customers lose old links from chat", c.auto_del_purchases)}
+        </div></div>
+      <div class="card"><h3>Clear chats now</h3><p class="sub-h">Removes promos and broadcasts from all chats immediately.</p>
+        <button class="btn danger" data-act="force-clear">${svg("trash")}Clear now</button></div>`;
+  },
+};
+
+/* ============ search ============ */
+function renderSearch(list){
+  $("#list").innerHTML = list.length ? list.map(u => `<div class="user">
+      <div class="user-head"><div><span class="name">@${esc(u.username || "none")}</span> <span class="mono dim">${esc(u.user_id)}</span></div>
+      <span class="pill ${u.purchases.length ? "solid" : ""}">${u.purchases.length} course${u.purchases.length === 1 ? "" : "s"}</span></div>
+      ${purchasesHtml(u.user_id, u.purchases)}</div>`).join("")
+    : empty("No user found for this ID or username.");
+}
+
+async function doSearch(q){
+  q = (q || "").trim();
+  if(!q) return;
+  lastQuery = q;
+  view = "search";
+  closeAll();
+  highlightNav(null);
+  $("#page-title").textContent = "Search";
+  $("#page-sub").textContent = "Results for “" + q + "”";
+  $("#body").innerHTML = `<div id="list"></div>`;
+  setListLoading();
+  try{
+    const d = await api("/dashboard/api/user-lookup?q=" + enc(q));
+    if(view === "search") renderSearch(d);
+  }catch(e){
+    if(view === "search") $("#list").innerHTML = empty(e.message);
   }
 }
 
-async function canO(id){ if(confirm("Cancel this order?")){ await fetch("/dashboard/api/orders/"+id+"/cancel",{method:"POST"}); load(); } }
-async function appr(id){ if(confirm("Approve order manually?")){ await fetch("/dashboard/api/orders/"+id+"/approve",{method:"POST"}); load(); } }
-async function delC(id){ if(confirm("Delete course?")){ await fetch("/dashboard/api/courses/"+id,{method:"DELETE"}); load(); } }
-async function delOffer(id){ if(confirm("Delete this offer?")){ await fetch("/dashboard/api/offers/"+id,{method:"DELETE"}); load(); } }
-async function createOffer(){
-  let d = { discount: document.getElementById('off_disc').value, target_type: document.getElementById('off_tgt').value, course_id: document.getElementById('off_cid').value, max_users: document.getElementById('off_max').value==-1?-1:(document.getElementById('off_max').value==0?-1:document.getElementById('off_max').value), per_user_limit: document.getElementById('off_peruser').value==0?-1:document.getElementById('off_peruser').value, hours: document.getElementById('off_hrs').value };
-  await fetch("/dashboard/api/offers", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(d)}); load();
-}
-async function saveSettings(){
-  await fetch("/dashboard/api/system-settings", {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
-      maintenance: document.getElementById("maint_toggle").checked,
-      cleanup_seconds: document.getElementById("cleanup_time").value,
-      auto_del_promos: document.getElementById("auto_del_promos").checked,
-      auto_del_broadcasts: document.getElementById("auto_del_broadcasts").checked,
-      auto_del_purchases: document.getElementById("auto_del_purchases").checked,
-      course_timer_minutes: document.getElementById("course_timer_minutes").value
-    })
-  });
+function go(v){
+  view = v;
+  closeAll();
+  highlightNav(v);
+  $("#page-title").textContent = TITLES[v];
+  $("#page-sub").textContent = SUBS[v] || "";
+  $("#body").innerHTML = SHELL[v]();
+  loadView();
 }
 
-document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{ document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active")); t.classList.add("active"); curTab=t.dataset.tab; document.getElementById("subtabs").style.display=curTab==="orders"?"flex":"none"; load(); }));
-document.querySelectorAll(".subtab").forEach(t=>t.addEventListener("click",()=>{ document.querySelectorAll(".subtab").forEach(x=>x.classList.remove("active")); t.classList.add("active"); curSt=t.dataset.status; load(); }));
-setInterval(()=>{ document.querySelectorAll("[data-remain]").forEach(el=>{ let s=Math.max(0,el.dataset.remain-1); el.dataset.remain=s; el.textContent=fmtSecs(s)+" bacha"; }); document.getElementById("clock").textContent=new Date().toLocaleTimeString("en-IN"); }, 1000);
-load(); setInterval(load, 15000);
-</script></body></html>"""
+/* ============ actions ============ */
+const fadeRow = el => { const r = el && el.closest(".row, .purch"); if(r) r.classList.add("removing"); };
+const refresh = () => loadView(true);
+
+const ACTIONS = {
+  "approve": async el => {
+    const ok = await confirmBox({title: "Approve this payment?", text: "The customer will receive the course immediately.", okText: "Approve", danger: false});
+    if(!ok) return;
+    fadeRow(el);
+    await api(`/dashboard/api/orders/${enc(el.dataset.id)}/approve`, {method: "POST"});
+    toast("Order approved"); refresh();
+  },
+  "cancel": async el => {
+    const ok = await confirmBox({title: "Cancel this order?", text: "The customer will be notified that the order was cancelled.", okText: "Cancel order"});
+    if(!ok) return;
+    fadeRow(el);
+    await api(`/dashboard/api/orders/${enc(el.dataset.id)}/cancel`, {method: "POST"});
+    toast("Order cancelled"); refresh();
+  },
+  "buyers": el => openBuyers(el.dataset.id, el.dataset.title),
+  "del-course": async el => {
+    const ok = await confirmBox({title: "Delete this course?", text: "This pack will be removed from the store. Existing buyers keep their access.", okText: "Delete"});
+    if(!ok) return;
+    fadeRow(el);
+    await api(`/dashboard/api/courses/${enc(el.dataset.id)}`, {method: "DELETE"});
+    toast("Course deleted"); refresh();
+  },
+  "create-offer": async () => {
+    const max = +$("#off-max").value, pu = +$("#off-peruser").value;
+    await api("/dashboard/api/offers", {method: "POST", body: {
+      discount: $("#off-disc").value, target_type: $("#off-tgt").value, course_id: $("#off-cid").value.trim(),
+      max_users: max === 0 ? -1 : max, per_user_limit: pu === 0 ? -1 : pu, hours: $("#off-hrs").value,
+    }});
+    toast("Offer created"); loadView(true);
+  },
+  "del-offer": async el => {
+    const ok = await confirmBox({title: "Delete this offer?", text: "The link will stop working immediately.", okText: "Delete"});
+    if(!ok) return;
+    fadeRow(el);
+    await api(`/dashboard/api/offers/${enc(el.dataset.id)}`, {method: "DELETE"});
+    toast("Offer deleted"); refresh();
+  },
+  "inject": async () => {
+    const amt = $("#inj-amt").value.trim();
+    if(!amt) throw new Error("Enter an amount");
+    const d = await api("/dashboard/api/inject-sms", {method: "POST", body: {amount: amt}});
+    toast("Result: " + d.result); loadView(true);
+  },
+  "send-broadcast": async () => {
+    const msg = $("#bc-msg").value.trim();
+    if(!msg) throw new Error("Message is empty");
+    const ok = await confirmBox({title: "Send to all users?", text: "This message will be delivered to every user of the bot.", okText: "Send", danger: false});
+    if(!ok) return;
+    await api("/dashboard/api/broadcast", {method: "POST", body: {message: msg}});
+    $("#bc-msg").value = "";
+    toast("Broadcast started");
+    loadView(true);
+    setTimeout(() => { if(view === "broadcast") loadView(true); }, 6000);
+  },
+  "rm-broadcast": async el => {
+    const ok = await confirmBox({title: "Remove this broadcast?", text: "It will be deleted from every user's chat. This cannot be undone.", okText: "Remove"});
+    if(!ok) return;
+    await api(`/dashboard/api/broadcasts/${enc(el.dataset.id)}`, {method: "DELETE"});
+    toast("Removing from chats…"); loadView(true);
+  },
+  "rm-purchase": async el => {
+    const ok = await confirmBox({title: "Remove this purchase?", text: "The customer will lose the ability to join this channel. Members already inside stay in the channel.", okText: "Remove"});
+    if(!ok) return;
+    await api("/dashboard/api/purchases", {method: "DELETE", body: {user_id: el.dataset.uid, course_id: el.dataset.cid}});
+    toast("Purchase removed");
+    const row = el.closest(".purch"); if(row) row.remove();
+    if(view === "search") doSearch(lastQuery); else loadView(true);
+  },
+  "force-clear": async () => {
+    const ok = await confirmBox({title: "Clear chats now?", text: "Promos and broadcasts will be removed from all user chats.", okText: "Clear"});
+    if(!ok) return;
+    await api("/dashboard/api/force-clear-chats", {method: "POST", body: {del_promos: true, del_broadcasts: true, del_purchases: false}});
+    toast("Clearing started");
+  },
+  "open-admins": () => { closeMenu(); openAdmins(); },
+  "refresh": () => {
+    closeMenu();
+    if(view === "search") doSearch(lastQuery); else loadView();
+    toast("Refreshed");
+  },
+  "close-menu": () => closeMenu(),
+  "close-modal": () => { pendingConfirm && settleConfirm(false); closeModal(); },
+  "cancel-confirm": () => settleConfirm(false),
+  "ok-confirm": () => settleConfirm(true),
+  "add-admin": async () => {
+    const v = $("#adm-id").value.trim();
+    if(!v) throw new Error("Enter a Telegram user ID");
+    await api("/dashboard/api/admins", {method: "POST", body: {user_id: v}});
+    $("#adm-id").value = "";
+    toast("Admin added"); loadAdmins();
+  },
+  "del-admin": async el => {
+    const ok = await confirmBox({title: "Remove this admin?", text: "They will lose access to the admin panel immediately.", okText: "Remove"});
+    if(!ok) return;
+    await api(`/dashboard/api/admins/${enc(el.dataset.id)}`, {method: "DELETE"});
+    toast("Admin removed"); loadAdmins();
+  },
+};
+
+document.addEventListener("click", async e => {
+  const nav = e.target.closest("[data-view]");
+  if(nav){ go(nav.dataset.view); return; }
+
+  const seg = e.target.closest("[data-of]");
+  if(seg){
+    orderFilter = seg.dataset.of;
+    document.querySelectorAll("[data-of]").forEach(b => b.classList.toggle("active", b === seg));
+    loadView();
+    return;
+  }
+
+  const act = e.target.closest("[data-act]");
+  if(!act) return;
+  const fn = ACTIONS[act.dataset.act];
+  if(!fn) return;
+  try { await fn(act); }
+  catch(err){ toast(err.message, "err"); }
+});
+
+/* settings save instantly on change */
+document.addEventListener("change", async e => {
+  const el = e.target.closest("[data-setting]");
+  if(!el) return;
+  const get = k => { const x = document.querySelector(`[data-setting="${k}"]`); return x ? (x.type === "checkbox" ? x.checked : x.value) : undefined; };
+  try{
+    await api("/dashboard/api/system-settings", {method: "POST", body: {
+      maintenance: get("maintenance"), cleanup_seconds: get("cleanup_seconds"),
+      auto_del_promos: get("auto_del_promos"), auto_del_broadcasts: get("auto_del_broadcasts"),
+      auto_del_purchases: get("auto_del_purchases"), course_timer_minutes: get("course_timer_minutes"),
+    }});
+    delete cache.settings;
+    toast("Settings saved");
+  }catch(err){ toast(err.message, "err"); }
+});
+
+/* ============ modal ============ */
+function openModal(title, html, opts = {}){
+  $("#modal-title").textContent = title;
+  $("#modal-body").innerHTML = html;
+  const foot = $("#modal-foot");
+  foot.innerHTML = opts.foot || "";
+  foot.style.display = opts.foot ? "flex" : "none";
+  $("#modal-box").classList.toggle("small", !!opts.small);
+  // confirm popup has no header title; hide the empty header
+  $("#modal-title").parentElement.style.display = title ? "flex" : "none";
+  $("#modal").classList.add("open");
+}
+function closeModal(){ $("#modal").classList.remove("open"); }
+
+function openAdmins(){
+  openModal("Admins", `
+    <div class="field"><label>Add an admin by Telegram user ID</label>
+      <div style="display:flex;gap:8px"><input id="adm-id" placeholder="e.g. 123456789" inputmode="numeric">
+      <button class="btn primary" data-act="add-admin" style="white-space:nowrap">Add admin</button></div>
+      <div class="hint">The person must send /start to the bot once before they can open the panel.</div></div>
+    <div id="adm-list" style="margin-top:18px"><div class="empty"><span class="spinner"></span></div></div>`);
+  loadAdmins();
+}
+async function loadAdmins(){
+  try{
+    const d = await api("/dashboard/api/admins");
+    $("#adm-list").innerHTML =
+      `<div class="row"><div class="grow"><div class="title">Owner</div><div class="meta mono">${esc(d.owner_id)}</div></div><span class="pill solid">Permanent</span></div>` +
+      (d.admins.length ? d.admins.map(a => `<div class="row">
+          <div class="grow"><div class="title">Admin</div><div class="meta mono">${esc(a.user_id)} · added ${esc(a.added_at)}</div></div>
+          <button class="btn danger sm" data-act="del-admin" data-id="${esc(a.user_id)}">${svg("trash")}Remove</button></div>`).join("")
+        : empty("No additional admins yet."));
+  }catch(e){ $("#adm-list").innerHTML = empty(e.message); }
+}
+
+async function openBuyers(id, title){
+  openModal("Buyers · " + title, `<div class="empty"><span class="spinner"></span></div>`);
+  try{
+    const d = await api(`/dashboard/api/courses/${enc(id)}/buyers`);
+    $("#modal-body").innerHTML = d.buyers.length ? d.buyers.map(b => `<div class="row">
+        <div class="grow"><div class="title">${esc(b.user)}</div><div class="meta mono">${esc(b.user_id)} · ${esc(b.purchased_at || "")}</div></div>
+        <div class="right"><div class="amount">₹${esc(b.amount)}</div>
+          <div class="end"><span class="pill">${esc(b.method || "")}</span>
+          ${d.is_channel ? `<span class="pill ${b.channel_joined ? "ok" : "warn"}">${b.channel_joined ? "Joined" : "Not joined"}</span>` : ""}</div></div></div>`).join("")
+      : empty("No buyers yet.");
+  }catch(e){ $("#modal-body").innerHTML = empty(e.message); }
+}
+
+/* ============ top bar + side panel ============ */
+const openDrawer = () => { $("#drawer").classList.add("open"); $("#overlay").classList.add("show"); };
+const closeDrawer = () => { $("#drawer").classList.remove("open"); $("#overlay").classList.remove("show"); };
+const closeMenu = () => $("#profile-menu").classList.remove("open");
+const closeAll = () => { closeDrawer(); closeMenu(); };
+
+$("#btn-menu").onclick = openDrawer;
+$("#overlay").onclick = closeDrawer;
+$("#btn-avatar").onclick = e => { e.stopPropagation(); $("#profile-menu").classList.toggle("open"); };
+$("#search-form").onsubmit = e => { e.preventDefault(); doSearch($("#q").value); };
+$("#modal").addEventListener("click", e => { if(e.target.id === "modal"){ if(pendingConfirm) settleConfirm(false); else closeModal(); } });
+
+document.addEventListener("click", e => {
+  if(!e.target.closest("#profile-menu") && !e.target.closest("#btn-avatar")) closeMenu();
+});
+document.addEventListener("keydown", e => {
+  if(e.key === "Escape"){ if(pendingConfirm) settleConfirm(false); closeAll(); closeModal(); }
+  const tag = document.activeElement.tagName;
+  if(e.key === "/" && tag !== "INPUT" && tag !== "TEXTAREA"){ e.preventDefault(); $("#q").focus(); }
+});
+
+/* ============ timers (kept light to save server cost) ============ */
+setInterval(() => {
+  $("#clock").textContent = new Date().toLocaleTimeString("en-IN", {hour: "2-digit", minute: "2-digit"});
+  document.querySelectorAll("[data-remain]").forEach(el => {
+    const s = Math.max(0, (+el.dataset.remain) - 1);
+    el.dataset.remain = s;
+    el.textContent = fmtSecs(s) + " left";
+  });
+}, 1000);
+// Only Dashboard and Orders auto-refresh, every 30 s, and never while the tab is hidden.
+setInterval(() => {
+  if(!document.hidden && (view === "home" || view === "orders")) loadView(true);
+}, 30000);
+
+buildNav();
+go("home");
+</script>
+</body>
+</html>
+"""  # Dashboard की पूरी screen (ये bot.py के अंदर ही है, अलग file की ज़रूरत नहीं)
+
+@app.route("/dashboard/api/admins", methods=["GET", "POST"])
+@require_auth
+def api_admins():
+    """Dashboard से Telegram ID डालो → वो user admin बन जाता है (Owner ENV वाला ही रहेगा)"""
+    if request.method == "POST":
+        raw = str((request.json or {}).get("user_id", "")).strip()
+        if not re.fullmatch(r"\d{5,15}", raw):
+            return jsonify({"error": "Enter a valid numeric Telegram ID (e.g. 123456789)"}), 400
+        uid = int(raw)
+        if uid == ADMIN_ID:
+            return jsonify({"error": "This ID is the owner and is already an admin."}), 400
+        admins_col.update_one({"user_id": uid}, {"$set": {"user_id": uid, "added_at": get_ist_time(), "added_by": "dashboard"}}, upsert=True)
+        refresh_admin_cache()
+        try: orig_send_message(uid, "🎉 <b>You are now an admin of this bot!</b>\nSend /start to open the Admin Panel.", parse_mode="HTML")
+        except Exception: pass
+        return jsonify({"status": "success"})
+
+    out = [{"user_id": a.get("user_id"), "added_at": a.get("added_at", "")} for a in admins_col.find().sort("_id", 1)]
+    return jsonify({"owner_id": ADMIN_ID, "admins": out})
+
+@app.route("/dashboard/api/admins/<int:uid>", methods=["DELETE"])
+@require_auth
+def api_delete_admin(uid):
+    if uid == ADMIN_ID: return jsonify({"error": "The owner cannot be removed"}), 400
+    admins_col.delete_one({"user_id": uid})
+    refresh_admin_cache()
+    return jsonify({"status": "success"})
 
 @app.route("/dashboard")
 @require_auth
