@@ -2323,6 +2323,28 @@ def sms_app_heartbeat(secret):
         }
     return jsonify(reply)
 
+def _is_logged_in():
+    return bool(DASHBOARD_PASSWORD and session.get("dash_ok"))
+
+_login_fail = {}  # IP -> गलत कोशिशों का समय (memory में, 15 मिनट की सीमा)
+
+def _login_blocked(ip):
+    now = time.time()
+    arr = [t for t in _login_fail.get(ip, []) if now - t < 900]
+    _login_fail[ip] = arr
+    return len(arr) >= 5
+
+def require_auth(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if _is_logged_in():
+            return f(*args, **kwargs)
+        # पहली setup (dashboard password अभी नहीं बना): सिर्फ़ config खुला रहता है, उसमें setup code लगता है
+        if not DASHBOARD_PASSWORD and request.path == "/dashboard/api/config":
+            return f(*args, **kwargs)
+        return jsonify({"error": "Login required", "login_required": True}), 401
+    return wrapper
+
 @app.route("/dashboard/api/app-update")
 @require_auth
 def api_app_update():
@@ -2353,28 +2375,6 @@ def api_app_update():
 @require_auth
 def api_app_status():
     return jsonify(_app_status_public())
-
-def _is_logged_in():
-    return bool(DASHBOARD_PASSWORD and session.get("dash_ok"))
-
-_login_fail = {}  # IP -> गलत कोशिशों का समय (memory में, 15 मिनट की सीमा)
-
-def _login_blocked(ip):
-    now = time.time()
-    arr = [t for t in _login_fail.get(ip, []) if now - t < 900]
-    _login_fail[ip] = arr
-    return len(arr) >= 5
-
-def require_auth(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if _is_logged_in():
-            return f(*args, **kwargs)
-        # पहली setup (dashboard password अभी नहीं बना): सिर्फ़ config खुला रहता है, उसमें setup code लगता है
-        if not DASHBOARD_PASSWORD and request.path == "/dashboard/api/config":
-            return f(*args, **kwargs)
-        return jsonify({"error": "Login required", "login_required": True}), 401
-    return wrapper
 
 def _strip_html(s): return re.sub(r"<[^>]*>", "", s or "").strip()
 def _order_ts(o):
