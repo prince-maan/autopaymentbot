@@ -4,6 +4,8 @@ import secrets
 import io
 import json
 import os
+import urllib.error
+import urllib.request
 import random
 import re
 import subprocess
@@ -101,6 +103,8 @@ BOT_CONFIG_KEYS = {
     "STALE_ORDER_HOURS": "24",
     "SMS_POOL_TTL_HOURS": "5",
     "ORDER_TTL_HOURS": "48",
+    "APP_GITHUB_REPO": "",
+    "APP_GITHUB_TOKEN": "",
 }
 
 _boot_client = None
@@ -2146,10 +2150,32 @@ BOT_USERNAME = "your_bot"
 @app.route("/")
 def home(): return "Telegram Bot API Running."
 
+_WEBHOOK_TEXT_KEYS = ("text", "message", "body", "sms", "msg")
+
+def _webhook_fields():
+    """SMS text और source को JSON, form या query string से निकालता है.
+    अलग-अलग forwarder apps अलग नाम भेजते हैं (text/message/body...), इसलिए सब मान लिए जाते हैं."""
+    data = {}
+    if request.method == "POST":
+        j = request.get_json(silent=True)
+        if isinstance(j, dict): data.update(j)
+        if request.form: data.update({k: v for k, v in request.form.items()})
+    data_args = {k: v for k, v in request.args.items()}
+    for k, v in data_args.items(): data.setdefault(k, v)
+    text = ""
+    for key in _WEBHOOK_TEXT_KEYS:
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            text = v.strip()
+            break
+    src = data.get("source")
+    src_name = str(src).strip()[:60] if isinstance(src, (str, int, float)) else ""
+    return text, src_name
+
 @app.route("/sms-webhook/<secret>", methods=["GET", "POST"])
 def sms_webhook(secret):
     if secret != SMS_HOOK_SECRET: return "forbidden", 403
-    sms_text = (request.get_json(silent=True) or request.form).get("text", "").strip() if request.method == "POST" else request.args.get("text", "").strip()
+    sms_text, src_name = _webhook_fields()
     if not sms_text: return "no 'text' param", 400
     
     m = AMOUNT_RE_DECIMAL.search(sms_text)
@@ -2159,7 +2185,7 @@ def sms_webhook(secret):
 
     amt_str = m.group(1).replace(",", "")
     f_round = f"{float(amt_str):.2f}" if not has_dec else amt_str
-    sms_pool_col.insert_one({"amount": f_round, "raw_text": sms_text, "status": "UNUSED", "created_at_dt": datetime.now(timezone.utc), "created_at_str": get_ist_time()})
+    sms_pool_col.insert_one({"amount": f_round, "raw_text": sms_text, "status": "UNUSED", "created_at_dt": datetime.now(timezone.utc), "created_at_str": get_ist_time(), "source": src_name})
 
     order, amb = None, False
     with pending_lock:
@@ -2181,6 +2207,152 @@ def sms_webhook(secret):
         except Exception: pass
         return "ambiguous", 200
     return "saved_to_pool", 200
+
+def _app_status_public():
+    """Android ऐप का आखिरी heartbeat, dashboard के status icon के लिए"""
+    try:
+        doc = settings_col.find_one({"_id": "app_status"}) or {}
+    except Exception:
+        doc = {}
+    last = doc.get("last_seen") or 0
+    return {
+        "online": bool(last) and (time.time() - last) < 150,
+        "connected_ever": bool(last),
+        "last_seen": doc.get("last_seen_str", ""),
+        "device": doc.get("device", ""),
+        "pending": doc.get("pending", 0),
+    }
+
+_GH_CACHE = {"t": 0.0, "data": None}
+_APK_CACHE = {"tag": "", "data": None}
+
+def _ver_tuple(s):
+    nums = re.findall(r"\d+", str(s or ""))
+    return tuple(int(x) for x in nums[:4]) or (0,)
+
+def _github_latest_release(force=False):
+    """GitHub से latest release लाता है। 10 मिनट तक cache रहता है, ताकि GitHub पर बार-बार call न जाए।"""
+    repo = str(CFG.get("APP_GITHUB_REPO", "") or "").strip()
+    if not repo:
+        return None
+    now = time.time()
+    age = now - _GH_CACHE["t"]
+    if _GH_CACHE["data"] is not None and (age < 600 or (force and age < 60)):
+        return _GH_CACHE["data"]
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "store-bot"}
+    tok = str(CFG.get("APP_GITHUB_TOKEN", "") or "").strip()
+    if tok:
+        headers["Authorization"] = "Bearer " + tok
+    try:
+        req = urllib.request.Request("https://api.github.com/repos/" + repo + "/releases/latest", headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            rel = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        print(f"⚠️ GitHub release check failed: {e}", flush=True)
+        _GH_CACHE["t"] = now
+        return _GH_CACHE["data"]
+    apk = next((a for a in rel.get("assets", []) if str(a.get("name", "")).lower().endswith(".apk")), None)
+    data = {"tag": rel.get("tag_name", ""), "notes": (rel.get("body") or "")[:500],
+            "published": rel.get("published_at", ""), "apk": apk}
+    _GH_CACHE["t"] = now
+    _GH_CACHE["data"] = data
+    return data
+
+def _download_apk(rel):
+    """APK लाता है। Private repo के लिए token यहीं सर्वर पर रहता है, फ़ोन को कभी नहीं जाता।"""
+    if _APK_CACHE["tag"] == rel["tag"] and _APK_CACHE["data"]:
+        return _APK_CACHE["data"]
+    asset = rel["apk"]
+    tok = str(CFG.get("APP_GITHUB_TOKEN", "") or "").strip()
+    if tok:
+        req = urllib.request.Request(asset["url"], headers={"Accept": "application/octet-stream",
+                                     "Authorization": "Bearer " + tok, "User-Agent": "store-bot"})
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        try:
+            with urllib.request.build_opener(_NoRedirect).open(req, timeout=30) as r:
+                data = r.read()
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("Location")
+            if e.code not in (301, 302, 303, 307, 308) or not loc:
+                raise
+            with urllib.request.urlopen(loc, timeout=120) as r2:
+                data = r2.read()
+    else:
+        req = urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": "store-bot"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = r.read()
+    _APK_CACHE["tag"] = rel["tag"]
+    _APK_CACHE["data"] = data
+    return data
+
+@app.route("/sms-webhook/<secret>/apk")
+def sms_app_apk(secret):
+    """Android ऐप यहीं से नया APK डाउनलोड करता है"""
+    if secret != SMS_HOOK_SECRET: return "forbidden", 403
+    rel = _github_latest_release()
+    if not rel or not rel.get("apk"): return "no apk", 404
+    data = _download_apk(rel)
+    return Response(data, mimetype="application/vnd.android.package-archive",
+                    headers={"Content-Disposition": "attachment; filename=app-update.apk"})
+
+@app.route("/sms-webhook/<secret>/heartbeat", methods=["GET", "POST"])
+def sms_app_heartbeat(secret):
+    """Android ऐप हर मिनट यहाँ 'मैं चालू हूँ' भेजता है, और Save के समय कनेक्शन टेस्ट के लिए"""
+    if secret != SMS_HOOK_SECRET: return "forbidden", 403
+    d = request.get_json(silent=True) or {}
+    try: pending = int(d.get("pending") or 0)
+    except (TypeError, ValueError): pending = 0
+    app_ver = str(d.get("app_version") or "")[:20]
+    settings_col.update_one({"_id": "app_status"}, {"$set": {
+        "last_seen": time.time(),
+        "last_seen_str": get_ist_time(),
+        "device": str(d.get("device") or "Android")[:80],
+        "pending": pending,
+        "app_version": app_ver,
+    }}, upsert=True)
+    reply = {"ok": True, "server_time": get_ist_time()}
+    rel = _github_latest_release()
+    if rel and rel.get("apk") and _ver_tuple(rel["tag"]) > _ver_tuple(app_ver):
+        reply["update"] = {
+            "available": True,
+            "version": rel["tag"],
+            "apk_url": request.host_url.rstrip("/") + "/sms-webhook/" + secret + "/apk",
+            "notes": rel.get("notes", "")[:300],
+        }
+    return jsonify(reply)
+
+@app.route("/dashboard/api/app-update")
+@require_auth
+def api_app_update():
+    """Dashboard की 'App update' page: GitHub पर नया version है या नहीं"""
+    repo = str(CFG.get("APP_GITHUB_REPO", "") or "").strip()
+    if not repo:
+        return jsonify({"configured": False})
+    check = request.args.get("check") == "1"
+    rel = _github_latest_release(force=check)
+    try:
+        installed = (settings_col.find_one({"_id": "app_status"}) or {}).get("app_version", "")
+    except Exception:
+        installed = ""
+    available = bool(rel and rel.get("apk") and _ver_tuple(rel["tag"]) > _ver_tuple(installed))
+    return jsonify({
+        "configured": True,
+        "repo": repo,
+        "installed": installed or "",
+        "latest": (rel or {}).get("tag", ""),
+        "has_apk": bool(rel and rel.get("apk")),
+        "available": available,
+        "notes": (rel or {}).get("notes", ""),
+        "published": (rel or {}).get("published", ""),
+        "error": "" if rel else "GitHub से जानकारी नहीं मिली। Repo नाम, token या internet जाँचें।",
+    })
+
+@app.route("/dashboard/api/app-status")
+@require_auth
+def api_app_status():
+    return jsonify(_app_status_public())
 
 def _is_logged_in():
     return bool(DASHBOARD_PASSWORD and session.get("dash_ok"))
@@ -2799,6 +2971,13 @@ main{padding:84px 18px 56px;max-width:1040px;margin:0 auto}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .total-row{display:flex;justify-content:space-between;align-items:center;margin-top:16px;padding-top:14px;border-top:1px solid var(--line);font-size:15px}
 .total-row strong{font-size:18px}
+.conn{display:flex;align-items:center;gap:7px;padding:6px 11px;border:1px solid var(--line-2);border-radius:999px;font-size:12px;color:var(--muted);white-space:nowrap}
+.conn .dot{width:8px;height:8px;border-radius:50%;background:var(--bad);flex:none}
+.conn.on{color:var(--text)}
+.conn.on .dot{background:var(--ok);box-shadow:0 0 0 3px rgba(74,222,128,.18)}
+.kv{display:flex;justify-content:space-between;gap:16px;padding:10px 0;border-top:1px solid var(--line);font-size:13.5px}
+.kv>div:first-child{color:var(--muted)}
+@media (max-width:640px){.conn-text{display:none}}
 </style>
 </head>
 <body>
@@ -2815,6 +2994,7 @@ main{padding:84px 18px 56px;max-width:1040px;margin:0 auto}
     <input id="q" type="text" placeholder="Search user by ID or username, press Enter" inputmode="search">
     <button type="submit">Search</button>
   </form>
+  <div class="conn" id="conn" title="App status"><span class="dot"></span><span class="conn-text" id="conn-text">Checking…</span></div>
   <div class="mono dim" id="clock"></div>
   <button class="avatar" id="btn-avatar" title="Account" aria-label="Account">A</button>
 </header>
@@ -2824,6 +3004,7 @@ main{padding:84px 18px 56px;max-width:1040px;margin:0 auto}
   <button data-act="open-admins">Admins</button>
   <button data-act="refresh">Refresh</button>
   <hr>
+  <button data-act="open-appupdate">App update</button>
   <button data-act="update-code">Update code</button>
   <button data-act="logout">Log out</button>
   <button data-act="close-menu">Close</button>
@@ -2913,7 +3094,7 @@ const NAV = [
   ["Sales", [["orders", "Orders", "check"], ["users", "Users & purchases", "users"]]],
   ["Store", [["courses", "Courses", "check"], ["offers", "Offers", "check"], ["logs", "Channel logs", "check"]]],
   ["Messaging", [["broadcast", "Broadcast", "check"], ["sms", "SMS pool & trigger", "check"]]],
-  ["System", [["setup", "Bot setup", "check"], ["settings", "Bot settings", "check"]]],
+  ["System", [["setup", "Bot setup", "check"], ["appupdate", "App update", "check"], ["settings", "Bot settings", "check"]]],
 ];
 const TITLES = {home: "Dashboard", orders: "Orders", users: "Users & purchases", courses: "Courses", offers: "Offers",
   logs: "Channel logs", broadcast: "Broadcast", sms: "SMS pool & trigger", settings: "Bot settings", setup: "Bot setup", search: "Search"};
@@ -2934,6 +3115,7 @@ function highlightNav(v){
 
 /* ============ screen templates ============ */
 const SHELL = {
+  appupdate: () => `<div id="list"></div>`,
   home: () => `<div class="note">Search any user from the top bar to see their full purchase history.</div><div id="list"></div>`,
   orders: () => `<div class="seg">${[["all","All"],["pending","Pending"],["completed","Completed"],["expired","Expired"]]
       .map(([k, l]) => `<button data-of="${k}" class="${k === orderFilter ? "active" : ""}">${l}</button>`).join("")}</div><div id="list"></div>`,
@@ -2977,6 +3159,7 @@ const FETCH = {
   sms: () => api("/dashboard/api/sms-pool"),
   settings: () => api("/dashboard/api/system-settings"),
   setup: () => api("/dashboard/api/config"),
+  appupdate: () => api("/dashboard/api/app-update"),
 };
 
 function setListLoading(){
@@ -3015,6 +3198,29 @@ function purchasesHtml(uid, list){
 }
 
 const RENDER = {
+  appupdate: c => {
+    if(!c.configured){
+      $("#list").innerHTML = `<div class="card"><h3>App update</h3><p class="sub-h">Bot setup में "GitHub repo" भरें (जैसे ravi/now-app), फिर यहाँ आएँ।</p></div>`;
+      return;
+    }
+    const status = c.available
+      ? `<span class="pill ok">New version ${esc(c.latest)} available</span>`
+      : c.latest
+        ? `<span class="pill">Up to date (latest ${esc(c.latest)})</span>`
+        : `<span class="pill warn">Could not read GitHub</span>`;
+    $("#list").innerHTML = `
+      <div class="card"><h3>App update</h3>
+        <p class="sub-h">${status}</p>
+        <div class="kv"><div>Repo</div><div class="mono">${esc(c.repo)}</div></div>
+        <div class="kv"><div>Installed on phone</div><div class="mono">${esc(c.installed || "not connected yet")}</div></div>
+        <div class="kv"><div>Latest on GitHub</div><div class="mono">${esc(c.latest || "—")}</div></div>
+        ${c.published ? `<div class="kv"><div>Published</div><div class="mono">${esc(c.published)}</div></div>` : ""}
+        ${c.error ? `<p class="sub-h" style="color:var(--bad)">${esc(c.error)}</p>` : ""}
+        ${c.notes ? `<div class="label-s" style="margin-top:14px">Release notes</div><pre class="mono" style="white-space:pre-wrap;margin:0;color:var(--muted)">${esc(c.notes)}</pre>` : ""}
+        <p class="sub-h" style="margin-top:14px">अपडेट दिखने पर ऐप को अगले एक मिनट में नोटिस मिल जाएगा। ऐप में Install दबाने पर Android की install screen खुलेगी।</p>
+        <div style="margin-top:14px;display:flex;justify-content:flex-end"><button class="btn primary" data-act="check-app-update">Check GitHub now</button></div>
+      </div>`;
+  },
   home: d => {
     $("#list").innerHTML = `<div class="stats">
       ${statCard("Today's earnings", money(d.today_amount), "orders")}
@@ -3158,8 +3364,21 @@ const RENDER = {
         row(["SMS_POOL_TTL_HOURS", "SMS pool keep time (hours)", "Default 5", "text", ""], v.SMS_POOL_TTL_HOURS),
       ].join(""));
 
-    const hook = `<div class="card"><h3>6. SMS webhook</h3>
+    const appStatus = c.app || {};
+    const appLine = appStatus.online
+      ? `<p class="sub-h" style="color:var(--ok)">✅ App connected: ${esc(appStatus.device || "Android")} · last seen ${esc(appStatus.last_seen)}</p>`
+      : appStatus.connected_ever
+        ? `<p class="sub-h" style="color:var(--warn)">⚪ App is offline. Last seen ${esc(appStatus.last_seen)}</p>`
+        : `<p class="sub-h">⚪ App not connected yet. Paste this link in the app and tap Save.</p>`;
+    const appUpd = section("6. App updates",
+      "Put the Android APK in your GitHub repo's Releases (tag like v1.1). The app is notified automatically.",
+      [
+        row(["APP_GITHUB_REPO", "GitHub repo", "Format owner/repo, for example ravi/now-app", "text", "mono"], v.APP_GITHUB_REPO),
+        row(["APP_GITHUB_TOKEN", "GitHub token (only for a private repo)", "Leave empty for a public repo. Shown masked.", "password", "mono"], v.APP_GITHUB_TOKEN),
+      ].join(""));
+    const hook = `<div class="card"><h3>7. SMS webhook</h3>
         <p class="sub-h">Paste the link below into your SMS forwarding app. Change the secret and the link updates by itself.</p>
+        ${appLine}
         <div class="field"><label>Webhook secret</label>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
             <input data-cfg="SMS_HOOK_SECRET" id="wh-secret" value="${esc(v.SMS_HOOK_SECRET)}" autocomplete="off" spellcheck="false" class="mono" style="flex:1;min-width:200px">
@@ -3175,7 +3394,7 @@ const RENDER = {
       ${codeCard}
       <div class="card"><h3>Bot status</h3><p class="sub-h">${status}</p>
         <p class="sub-h" style="margin:0">Fields marked * are required. After you save, the bot restarts by itself in a few seconds.</p></div>
-      ${mongo}${bot}${payment}${timers}${pool}${hook}
+      ${mongo}${bot}${payment}${timers}${pool}${appUpd}${hook}
       <div style="display:flex;justify-content:flex-end;margin:4px 0 24px"><button class="btn primary" data-act="save-config">Save and restart bot</button></div>`;
 
     // Webhook link: builds itself as you type the secret
@@ -3391,6 +3610,16 @@ const ACTIONS = {
       toast(e.message, "err");
     }
   },
+  "open-appupdate": () => { closeMenu(); go("appupdate"); },
+  "check-app-update": async () => {
+    try {
+      await api("/dashboard/api/app-update?check=1");
+      toast("Checked GitHub");
+    } catch(e) {
+      toast(e.message, "err");
+    }
+    loadView(true);
+  },
   "logout": async () => {
     closeMenu();
     try { await fetch("/dashboard/logout", {method: "POST"}); } catch(e) {}
@@ -3541,6 +3770,21 @@ setInterval(() => {
   if(!document.hidden && (view === "home" || view === "orders")) loadView(true);
 }, 30000);
 
+/* ============ app connection icon (top bar) ============ */
+async function refreshConn(){
+  try{
+    const s = await api("/dashboard/api/app-status");
+    const el = $("#conn");
+    el.classList.toggle("on", !!s.online);
+    let text = s.online ? "App online" : (s.connected_ever ? "App offline" : "App not connected");
+    if(s.online && s.pending) text += " · " + s.pending + " pending";
+    $("#conn-text").textContent = text;
+    el.title = s.connected_ever ? ("Device: " + (s.device || "—") + " · Last seen: " + s.last_seen) : "App has not connected yet";
+  }catch(e){}
+}
+refreshConn();
+setInterval(() => { if(!document.hidden) refreshConn(); }, 30000);
+
 buildNav();
 api("/dashboard/api/config")
   .then(c => { if(location.hash) routeFromHash(); else go(c.configured ? "home" : "setup", false); })
@@ -3639,8 +3883,11 @@ def api_config():
                 "STALE_ORDER_HOURS": cfg.get("STALE_ORDER_HOURS", "24"),
                 "SMS_POOL_TTL_HOURS": cfg.get("SMS_POOL_TTL_HOURS", "5"),
                 "ORDER_TTL_HOURS": cfg.get("ORDER_TTL_HOURS", "48"),
+                "APP_GITHUB_REPO": cfg.get("APP_GITHUB_REPO", ""),
+                "APP_GITHUB_TOKEN": _mask(cfg.get("APP_GITHUB_TOKEN", "")),
             },
             "boot": _boot_public(),
+            "app": _app_status_public(),
         })
 
     d = request.get_json(silent=True) or {}
@@ -3702,6 +3949,12 @@ def api_config():
             continue
         if k == "BOT_TOKEN" and not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{20,}", v):
             return jsonify({"error": "Bot token looks wrong. Paste the full token from BotFather."}), 400
+        if k == "APP_GITHUB_REPO" and v and not re.fullmatch(r"[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+", v):
+            return jsonify({"error": "GitHub repo 'owner/repo' जैसा होना चाहिए, जैसे ravi/now-app"}), 400
+        if k == "APP_GITHUB_TOKEN" and (not v or "•" in v):
+            if cur.get("APP_GITHUB_TOKEN"):
+                new["APP_GITHUB_TOKEN"] = cur["APP_GITHUB_TOKEN"]
+            continue
         if k == "ADMIN_ID" and v and not re.fullmatch(r"\d{5,15}", v):
             return jsonify({"error": "Owner ID must be a numeric Telegram ID."}), 400
         if k == "DB_CHANNEL_ID" and v and not re.fullmatch(r"-?\d{5,20}", v):
