@@ -4,3 +4,4 @@ Pillow
 qrcode
 pymongo
 dnspython
+python-dotenv
