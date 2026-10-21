@@ -100,7 +100,7 @@ BOT_CONFIG_KEYS = {
     "CHAT_LINK": "",
     "INTERNATIONAL_LINK": "",
     "QR_EXPIRY_MINUTES": "10",
-    "STALE_ORDER_HOURS": "24",
+    "STALE_ORDER_HOURS": "12",
     "SMS_POOL_TTL_HOURS": "5",
     "ORDER_TTL_HOURS": "48",
     "APP_GITHUB_REPO": "",
@@ -150,7 +150,7 @@ SMS_HOOK_SECRET = CFG["SMS_HOOK_SECRET"].strip()
 CHAT_LINK = CFG["CHAT_LINK"].strip()
 INTERNATIONAL_LINK = CFG["INTERNATIONAL_LINK"].strip()
 QR_EXPIRY_SECONDS = int(_to_num(CFG["QR_EXPIRY_MINUTES"], 10) * 60)
-STALE_ORDER_SECONDS = int(_to_num(CFG["STALE_ORDER_HOURS"], 24) * 3600)
+STALE_ORDER_SECONDS = int(_to_num(CFG["STALE_ORDER_HOURS"], 12) * 3600)
 SMS_POOL_TTL_HOURS = int(_to_num(CFG["SMS_POOL_TTL_HOURS"], 5))
 ORDER_TTL_HOURS = int(_to_num(CFG["ORDER_TTL_HOURS"], 48))
 
@@ -549,23 +549,47 @@ def clear_user_state(user_id):
         except: pass
     threading.Thread(target=_bg, daemon=True).start()
 
-def generate_unique_amount(base_amount):
-    global paise_counter
-    base_clean = int(float(base_amount))
-    with paise_lock:
-        paise_counter = (paise_counter % 99) + 1
-        current_p = paise_counter
+alloc_lock = threading.Lock()
+reserved_now = {}  # amount -> समय; order बनने की प्रक्रिया में चल रहे amounts (race से बचाव)
+ALLOC_RESERVE_SECONDS = 900
 
-    candidate = f"{base_clean + (current_p / 100.0):.2f}"
+def get_order_hold_seconds():
+    """Expired/pending order का amount कितने समय तक late SMS के लिए बुक रहेगा.
+    Dashboard > Settings > 'Order amount hold' से बदला जाता है. Default 12 घंटे."""
+    cfg = get_cached_setting("system_settings") or {}
+    try: hrs = float(cfg.get("order_hold_hours", 12))
+    except (TypeError, ValueError): hrs = 12.0
+    return max(1.0, hrs) * 3600
+
+def _taken_amounts(base_clean):
+    """उस base (जैसे 50) के 50.01 से 50.99 तक में कौन से amounts बुक हैं"""
+    cands = [f"{base_clean + p / 100:.2f}" for p in range(1, 100)]
+    taken = set()
+    now = time.time()
     with pending_lock:
-        if candidate not in pending_orders:
-            return candidate
-        for offset in range(1, 100):
-            alt_p = ((current_p + offset - 1) % 99) + 1
-            alt_candidate = f"{base_clean + (alt_p / 100.0):.2f}"
-            if alt_candidate not in pending_orders:
-                return alt_candidate
-    return candidate
+        taken.update(k for k in pending_orders.keys() if k in cands)
+    for k, ts in list(reserved_now.items()):
+        if now - ts < ALLOC_RESERVE_SECONDS: taken.add(k)
+        else: reserved_now.pop(k, None)
+    # वही orders जो webhook अभी भी match कर सकता है: PENDING, या hold समय के अंदर EXPIRED
+    cutoff = now - get_order_hold_seconds()
+    for o in orders_col.find({"amount": {"$in": cands}, "status": {"$in": ["PENDING", "EXPIRED"]}, "created_at": {"$gte": cutoff}}, {"amount": 1}):
+        taken.add(o.get("amount"))
+    # SMS pool में बिना match के पड़े SMS: उन amounts पर नया order नहीं देंगे, वरना पुराना SMS गलत match हो जाएगा
+    for sm in sms_pool_col.find({"amount": {"$in": cands}, "status": "UNUSED"}, {"amount": 1}):
+        taken.add(sm.get("amount"))
+    return cands, taken
+
+def generate_unique_amount(base_amount):
+    """सबसे छोटा खाली paise वाला amount देता है (जैसे 50.10). पेमेंट approve/cancel होते ही वो amount फिर से खाली हो जाता है.
+    सारे 99 बुक हों तो None लौटता है."""
+    base_clean = int(float(base_amount))
+    cands, taken = _taken_amounts(base_clean)
+    for c in cands:
+        if c not in taken:
+            reserved_now[c] = time.time()
+            return c
+    return None
 
 # ==========================================
 # 🎟 DYNAMIC PRICE & OFFER VALIDATION
@@ -1778,7 +1802,16 @@ def handle_buttons(call):
                         try: bot.delete_message(chat_id, user_qr_messages.pop(chat_id))
                         except Exception: pass
                         
-                order_id, amt_key = str(uuid.uuid4())[:8], generate_unique_amount(final_price)
+                order_id = str(uuid.uuid4())[:8]
+                with alloc_lock:
+                    amt_key = generate_unique_amount(final_price)
+                if amt_key is None:
+                    try:
+                        if wait_msg: bot.delete_message(chat_id, wait_msg.message_id)
+                    except Exception: pass
+                    try: bot.send_message(chat_id, "⚠️ <b>इस समय बहुत सारे payments चल रहे हैं।</b>\nकृपया कुछ मिनट बाद फिर से कोशिश करें।", parse_mode="HTML", msg_type="general")
+                    except Exception: pass
+                    return
                 u_men = f"<a href='tg://user?id={call.from_user.id}'>{call.from_user.first_name}</a> (@{call.from_user.username or ''})"
                 o_data = {
                     "order_id": order_id, "course_id": course_id, "user_id": call.from_user.id, "chat_id": chat_id,
@@ -1804,6 +1837,7 @@ def handle_buttons(call):
                 except Exception: pass
                 
                 orders_col.insert_one(o_data.copy())
+                reserved_now.pop(amt_key, None)
                 with pending_lock:
                     pending_orders[amt_key] = o_data
                     all_orders_cache[order_id] = o_data
@@ -2194,7 +2228,7 @@ def sms_webhook(secret):
         else: amb = len(cands) > 1
 
     if not order:
-        stale_cutoff = time.time() - STALE_ORDER_SECONDS
+        stale_cutoff = time.time() - get_order_hold_seconds()
         order = orders_col.find_one({"amount": f_round, "status": {"$in": ["PENDING", "EXPIRED"]}, "created_at": {"$gte": stale_cutoff}})
     
     if order:
@@ -2421,6 +2455,28 @@ def api_orders():
         })
     return jsonify(out)
 
+@app.route("/dashboard/api/orders/clear-open", methods=["POST"])
+@require_auth
+def api_clear_open_orders():
+    """सारे PENDING और EXPIRED orders CANCELLED करता है, ताकि उनके amounts फिर खाली हो जाएँ. कुछ delete नहीं होता, COMPLETED orders को नहीं छुआ जाता."""
+    to_clear = list(orders_col.find({"status": {"$in": ["PENDING", "EXPIRED"]}}))
+    if not to_clear: return jsonify({"status": "success", "cleared": 0})
+    ids = [o["order_id"] for o in to_clear if o.get("order_id")]
+    res = orders_col.update_many({"order_id": {"$in": ids}, "status": {"$in": ["PENDING", "EXPIRED"]}},
+                                 {"$set": {"status": "CANCELLED", "cleared_at": get_ist_time()}})
+    with pending_lock:
+        for k, v in list(pending_orders.items()):
+            if v.get("order_id") in ids: pending_orders.pop(k, None)
+    for oid in ids:
+        o = all_orders_cache.get(oid)
+        if isinstance(o, dict): o["status"] = "CANCELLED"
+    def _update_channel():
+        for o in to_clear:
+            try: update_channel_order_status(o, "CANCELLED")
+            except Exception: pass
+    threading.Thread(target=_update_channel, daemon=True).start()
+    return jsonify({"status": "success", "cleared": res.modified_count})
+
 @app.route("/dashboard/api/orders/<order_id>/approve", methods=["POST"])
 @require_auth
 def api_approve_order(order_id):
@@ -2547,6 +2603,7 @@ def api_system_settings():
             "auto_del_purchases": data.get("auto_del_purchases", False),
             "protect_content": bool(data.get("protect_content", False)),
             "course_timer_minutes": int(data.get("course_timer_minutes", 0)),
+            "order_hold_hours": max(1, int(float(data.get("order_hold_hours", 12) or 12))),
             "updated_at": get_ist_time()
         }
         settings_col.update_one({"_id": "system_settings"}, {"$set": doc}, upsert=True)
@@ -2570,6 +2627,7 @@ def api_system_settings():
     return jsonify({
         "maintenance": cfg.get("maintenance", False),
         "cleanup_seconds": int(cfg.get("cleanup_seconds", 86400)),
+        "order_hold_hours": int(cfg.get("order_hold_hours", 12)),
         "auto_del_promos": cfg.get("auto_del_promos", True),
         "auto_del_broadcasts": cfg.get("auto_del_broadcasts", True),
         "auto_del_purchases": cfg.get("auto_del_purchases", False),
@@ -3118,7 +3176,7 @@ const SHELL = {
   appupdate: () => `<div id="list"></div>`,
   home: () => `<div class="note">Search any user from the top bar to see their full purchase history.</div><div id="list"></div>`,
   orders: () => `<div class="seg">${[["all","All"],["pending","Pending"],["completed","Completed"],["expired","Expired"]]
-      .map(([k, l]) => `<button data-of="${k}" class="${k === orderFilter ? "active" : ""}">${l}</button>`).join("")}</div><div id="list"></div>`,
+      .map(([k, l]) => `<button data-of="${k}" class="${k === orderFilter ? "active" : ""}">${l}</button>`).join("")}</div><div class="toolbar" style="margin:12px 0"><button class="btn danger sm" data-act="clear-open">Clear open orders</button></div><div id="list"></div>`,
   users: () => `<div class="note">Recent users and their courses. Use the search bar to find a specific user.</div><div id="list"></div>`,
   courses: () => `<div class="note">Create new packs from the bot's Admin Panel (Packs & Batches). You can view and remove them here.</div><div id="list"></div>`,
   offers: () => `<div class="card"><h3>Create offer</h3><p class="sub-h">Generates a discount link you can share.</p>
@@ -3354,7 +3412,6 @@ const RENDER = {
       "How long a payment QR stays valid and how long old orders are kept.",
       [
         row(["QR_EXPIRY_MINUTES", "QR expiry (minutes)", "Default 10", "text", ""], v.QR_EXPIRY_MINUTES),
-        row(["STALE_ORDER_HOURS", "Stale order window (hours)", "Default 24", "text", ""], v.STALE_ORDER_HOURS),
         row(["ORDER_TTL_HOURS", "Order keep time (hours)", "Default 48", "text", ""], v.ORDER_TTL_HOURS),
       ].join(""));
 
@@ -3416,6 +3473,8 @@ const RENDER = {
         ${tgl("maintenance", "Maintenance", "Customers see a maintenance message", c.maintenance)}</div>
       <div class="card"><h3>Course auto-delete</h3><p class="sub-h">Content a customer opens is removed after this time.</p>
         <div class="field"><select data-setting="course_timer_minutes">${opt(c.course_timer_minutes, [[0,"Off"],[5,"5 minutes"],[10,"10 minutes"],[20,"20 minutes"],[30,"30 minutes"]])}</select></div></div>
+      <div class="card"><h3>Order amount hold</h3><p class="sub-h">Paid or cancelled orders free their amount at once. An expired order keeps its amount this long, so a late payment can still be matched.</p>
+        <div class="field"><select data-setting="order_hold_hours">${opt(c.order_hold_hours, [[6,"6 hours"],[12,"12 hours (default)"],[24,"24 hours"],[48,"48 hours"]])}</select></div></div>
       <div class="card"><h3>Chat auto-clear</h3><p class="sub-h">Clean up chats after a period of inactivity.</p>
         <div class="field"><select data-setting="cleanup_seconds">${opt(c.cleanup_seconds, [[0,"Off"],[3600,"1 hour"],[43200,"12 hours"],[86400,"24 hours"],[172800,"48 hours"]])}</select></div>
         <div style="margin-top:12px">
@@ -3513,6 +3572,12 @@ const ACTIONS = {
     fadeRow(el);
     await api(`/dashboard/api/orders/${enc(el.dataset.id)}/cancel`, {method: "POST"});
     toast("Order cancelled"); refresh();
+  },
+  "clear-open": async () => {
+    const ok = await confirmBox({title: "Clear all open orders?", text: "Every PENDING and EXPIRED order will be cancelled, so their amounts become free again. Completed orders are not touched and nothing is deleted.", okText: "Clear all"});
+    if(!ok) return;
+    const r = await api("/dashboard/api/orders/clear-open", {method: "POST"});
+    toast("Cleared " + (r.cleared || 0) + " open orders"); refresh();
   },
   "buyers": el => openBuyers(el.dataset.id, el.dataset.title),
   "del-course": async el => {
@@ -3679,7 +3744,7 @@ document.addEventListener("change", async e => {
     await api("/dashboard/api/system-settings", {method: "POST", body: {
       maintenance: get("maintenance"), cleanup_seconds: get("cleanup_seconds"),
       auto_del_promos: get("auto_del_promos"), auto_del_broadcasts: get("auto_del_broadcasts"),
-      auto_del_purchases: get("auto_del_purchases"), protect_content: get("protect_content"), course_timer_minutes: get("course_timer_minutes"),
+      auto_del_purchases: get("auto_del_purchases"), protect_content: get("protect_content"), course_timer_minutes: get("course_timer_minutes"), order_hold_hours: get("order_hold_hours"),
     }});
     delete cache.settings;
     toast("Settings saved");
@@ -4070,7 +4135,18 @@ def api_update_code():
         return subprocess.run(["git", *args], cwd=APP_DIR, capture_output=True, text=True, timeout=timeout, env=env)
     try:
         before = git("rev-parse", "HEAD", timeout=30).stdout.strip()
-        pull = git("pull", "--ff-only")
+        # VM पर bot.py में हाथ से किए गए बदलाव (local changes) pull को रोकते हैं.
+        # इसलिए पहले पुरानी फ़ाइल का backup लेते हैं, फिर GitHub वाला code सीधे लेते हैं.
+        fetch = git("fetch", "--quiet", timeout=120)
+        if fetch.returncode != 0:
+            return jsonify({"error": "GitHub से connect नहीं हो पाया। Internet या GitHub login जाँचें.",
+                            "details": (fetch.stdout + fetch.stderr).strip()[-800:]}), 400
+        try:
+            import shutil
+            shutil.copy2(os.path.join(APP_DIR, "bot.py"), os.path.join(APP_DIR, f"bot.py.bak_{int(time.time())}"))
+        except Exception:
+            pass
+        pull = git("reset", "--hard", "@{u}", timeout=120)
         if pull.returncode != 0:
             return jsonify({"error": "Git pull नहीं हो पाया। Server पर कोई local बदलाव या GitHub login की दिक्कत हो सकती है.",
                             "details": (pull.stdout + pull.stderr).strip()[-800:]}), 400
