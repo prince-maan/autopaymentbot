@@ -4048,9 +4048,15 @@ def api_config():
     return jsonify({"status": "success", "restarting": True, "found": found})
 
 def _restart_later():
+    """बोट को नए process के रूप में दोबारा शुरू करता है.
+    नया process 4 सेकंड बाद शुरू होता है, तब तक पुराना process port छोड़कर पूरी तरह बंद हो चुका होता है."""
     time.sleep(2)
     print("🔄 Restarting bot with new settings...", flush=True)
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    import shlex
+    cmd = "sleep 4; exec " + " ".join(shlex.quote(a) for a in [sys.executable] + sys.argv)
+    subprocess.Popen(["sh", "-c", cmd], cwd=APP_DIR, stdin=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(1)
+    os._exit(0)
 
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
