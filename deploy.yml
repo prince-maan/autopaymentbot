@@ -1,0 +1,39 @@
+name: Deploy bot to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        env:
+          AWS_SSH_KEY: ${{ secrets.AWS_SSH_KEY }}
+          AWS_HOST: ${{ secrets.AWS_HOST }}
+          AWS_USER: ${{ secrets.AWS_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AWS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$AWS_HOST" >> ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key "$AWS_USER@$AWS_HOST" 'bash -s' <<'REMOTE'
+          set -e
+          cd ~/mybot/autopaymentbot
+          git fetch origin
+          git reset --hard origin/main
+          ./venv/bin/pip install -r requirements.txt
+          pkill -f "venv/bin/python bot.py" || true
+          sleep 3
+          nohup ./venv/bin/python bot.py < /dev/null >> bot.log 2>&1 &
+          sleep 10
+          if curl -sf http://127.0.0.1:10000/ > /dev/null; then
+            echo "BOT IS UP"
+          else
+            echo "BOT IS NOT UP, last log lines:"
+            tail -30 bot.log
+            exit 1
+          fi
+          REMOTE
