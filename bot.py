@@ -865,6 +865,21 @@ def handle_menu_action(user_id, btn, first_name):
         try: orig_send_message(user_id, btn["value"], parse_mode="HTML")
         except Exception: orig_send_message(user_id, re.sub(r"<[^>]*>", "", btn["value"]))
 
+CHAT_TITLE_CACHE = {}
+
+def channel_title_for(course):
+    """Channel का असली नाम: पहले channel_name, नहीं तो Telegram से चैनल का title, फिर pack का title"""
+    name = (course or {}).get("channel_name")
+    if name: return name
+    ids = (course or {}).get("channel_ids") or []
+    cid = (course or {}).get("channel_id") or (ids[0] if ids else None)
+    if cid:
+        if cid not in CHAT_TITLE_CACHE:
+            try: CHAT_TITLE_CACHE[cid] = bot.get_chat(int(cid)).title or ""
+            except Exception: CHAT_TITLE_CACHE[cid] = ""
+        if CHAT_TITLE_CACHE[cid]: return CHAT_TITLE_CACHE[cid]
+    return (course or {}).get("title") or (course or {}).get("course_id") or "Channel"
+
 def get_footer_text():
     saved = get_cached_setting("menu_cfg") or {}
     return saved["footer"] if "footer" in saved else "🔥 More packs coming soon, stay tuned!"
@@ -875,8 +890,8 @@ def send_my_orders(user_id, first_name):
 
     def label(cid):
         if cid not in info_cache:
-            c = courses_col.find_one({"course_id": cid}, {"channel_name": 1, "title": 1}) or {}
-            info_cache[cid] = c.get("channel_name") or c.get("title") or cid
+            c = courses_col.find_one({"course_id": cid}, {"channel_name": 1, "title": 1, "channel_id": 1, "channel_ids": 1}) or {}
+            info_cache[cid] = channel_title_for(c) if c else cid
         return info_cache[cid]
 
     lines = ["📋 <b>MY ORDER LIST</b>", "━━━━━━━━━━━━━━", "",
@@ -912,7 +927,10 @@ def send_my_orders(user_id, first_name):
     link = CHAT_LINK if str(CHAT_LINK).startswith(("http", "tg://")) else f"tg://user?id={ADMIN_ID}"
     markup = InlineKeyboardMarkup().row(kbtn("💬 Contact Admin", url=link))
     try: orig_send_message(user_id, text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
-    except Exception: pass
+    except Exception as e:
+        print(f"⚠️ My Orders HTML error: {e}", flush=True)
+        try: orig_send_message(user_id, re.sub(r"<[^>]*>", "", text), reply_markup=markup, disable_web_page_preview=True)
+        except Exception as e2: print(f"⚠️ My Orders send failed: {e2}", flush=True)
 
 def get_live_cfg():
     saved = get_cached_setting("live_feed_cfg") or {}
@@ -952,21 +970,60 @@ def post_live_feed(name, amount, channel_label, link=""):
         orig_send_message(int(cfg["channel_id"]), text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
         return True
     except Exception as e:
-        print(f"⚠️ live feed post failed: {e}", flush=True)
-        return False
+        print(f"⚠️ live feed post failed, plain fallback: {e}", flush=True)
+        try:
+            orig_send_message(int(cfg["channel_id"]), re.sub(r"<[^>]*>", "", text), reply_markup=markup, disable_web_page_preview=True)
+            return True
+        except Exception as e2:
+            print(f"⚠️ live feed post failed: {e2}", flush=True)
+            return False
+
+LIVE_JOB = {"status": "idle", "total": 0, "done": 0, "failed": 0, "stop": False, "started": "", "message": ""}
+LIVE_JOB_LOCK = threading.Lock()
+
+def live_job_snapshot():
+    with LIVE_JOB_LOCK:
+        j = dict(LIVE_JOB)
+    j.pop("stop", None)
+    j["percent"] = 100 if not j["total"] else min(100, round((j["done"] + j["failed"]) * 100 / j["total"]))
+    return j
 
 def backfill_live_feed():
-    """पुरानी purchases (जो अभी तक feed में नहीं गईं) एक-एक करके feed में भेजो"""
-    for p in purchases_col.find({"feed_posted": {"$ne": True}}).sort("_id", 1):
-        cid = str(p.get("item_info", "")).split(" | ")[0]
-        course = courses_col.find_one({"course_id": cid}, {"channel_name": 1, "title": 1, "secret_text": 1}) or {}
-        label = course.get("channel_name") or p.get("title") or course.get("title") or cid
-        ok = post_live_feed(feed_display_name(p.get("username", ""), p.get("user_id")), purchase_amount(p), label,
-                            extract_invite_link(course.get("secret_text", "")))
-        if ok: purchases_col.update_one({"_id": p["_id"]}, {"$set": {"feed_posted": True}})
-        time.sleep(3.2)  # Telegram: एक group/channel में लगभग 20 messages प्रति मिनट
-    settings_col.update_one({"_id": "live_feed_cfg"}, {"$set": {"backfilled_at": get_ist_time()}}, upsert=True)
-    invalidate_cache("live_feed_cfg")
+    """पुरानी purchases को feed में एक-एक करके भेजो. हर भेजने के बाद progress अपडेट होती है, और stop हो सकता है."""
+    status, msg = "done", ""
+    try:
+        for p in purchases_col.find({"feed_posted": {"$ne": True}}).sort("_id", 1):
+            with LIVE_JOB_LOCK:
+                stop = LIVE_JOB["stop"]
+            if stop:
+                status = "stopped"; break
+            if not get_live_cfg()["enabled"]:
+                status, msg = "stopped", "Live feed बंद है"; break
+            cid = str(p.get("item_info", "")).split(" | ")[0]
+            course = courses_col.find_one({"course_id": cid}, {"channel_name": 1, "title": 1, "secret_text": 1, "channel_id": 1, "channel_ids": 1}) or {}
+            ok = post_live_feed(feed_display_name(p.get("username", ""), p.get("user_id")), purchase_amount(p),
+                                channel_title_for(course), extract_invite_link(course.get("secret_text", "")))
+            if ok: purchases_col.update_one({"_id": p["_id"]}, {"$set": {"feed_posted": True}})
+            with LIVE_JOB_LOCK:
+                LIVE_JOB["done" if ok else "failed"] += 1
+            time.sleep(3.2)  # Telegram: एक channel में लगभग 20 messages प्रति मिनट
+    except Exception as e:
+        status, msg = "error", str(e)[:200]
+        print(f"⚠️ live feed job error: {e}", flush=True)
+    with LIVE_JOB_LOCK:
+        LIVE_JOB.update(status=status, message=msg, updated=get_ist_time())
+    if status == "done":
+        settings_col.update_one({"_id": "live_feed_cfg"}, {"$set": {"backfilled_at": get_ist_time()}}, upsert=True)
+        invalidate_cache("live_feed_cfg")
+
+def start_backfill_job():
+    """एक समय में एक ही job. चालू हो तो False"""
+    with LIVE_JOB_LOCK:
+        if LIVE_JOB["status"] in ("running", "stopping"): return False
+        total = purchases_col.count_documents({"feed_posted": {"$ne": True}})
+        LIVE_JOB.update(status="running", total=total, done=0, failed=0, stop=False, started=get_ist_time(), message="")
+    threading.Thread(target=backfill_live_feed, daemon=True).start()
+    return True
 
 SUCC_DEFAULTS = {
     "header": "🎉 <b>Payment Successful!</b>",
@@ -1366,6 +1423,12 @@ def show_admin_category(chat_id, msg_id, key):
 # ==========================================
 # COMMANDS & HANDLERS
 # ==========================================
+@bot.message_handler(commands=["orders"])
+def orders_command(message):
+    """/orders = My Order List (बटन के बिना भी चलता है)"""
+    if is_banned(message.chat.id, getattr(message.from_user, "username", None)): return
+    send_my_orders(message.chat.id, getattr(message.from_user, "first_name", ""))
+
 @bot.message_handler(commands=["cancel"])
 def cancel_command(message):
     """किसी भी चल रहे step/flow को रोकने के लिए (user + admin दोनों)"""
@@ -1498,10 +1561,13 @@ def handle_all_messages(message):
         orig_send_message(user_id, "⚠ <b>Bot is currently under maintenance.</b>\nServers are busy or undergoing updates. Please try again after some time.", parse_mode="HTML")
         return
     if is_banned(user_id, getattr(message.from_user, "username", None)): return
-    if message.content_type == "text" and not (is_admin(user_id) and user_id in admin_data):
+    if message.content_type == "text":
         mb = find_menu_button(message.text)
         if mb:
-            handle_menu_action(user_id, mb, getattr(message.from_user, "first_name", ""))
+            try: handle_menu_action(user_id, mb, getattr(message.from_user, "first_name", ""))
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                orig_send_message(user_id, "⚠️ Something went wrong. Please try again in a moment.")
             return
     if not check_rate_limit(user_id, 1): return
     register_activity(user_id, message.message_id, "general")
@@ -3318,8 +3384,8 @@ def api_menu_config():
         invalidate_cache("live_feed_cfg")
         if live_set["enabled"] and live_set["channel_id"] and live_set["channel_id"] != old_live["channel_id"]:
             purchases_col.update_many({}, {"$unset": {"feed_posted": ""}})
-            threading.Thread(target=backfill_live_feed, daemon=True).start()
-            return jsonify({"status": "success", "backfill": "started"})
+            if start_backfill_job(): return jsonify({"status": "success", "backfill": "started"})
+            return jsonify({"status": "success", "backfill": "busy"})
     return jsonify({"status": "success"})
 
 @app.route("/dashboard/api/live-feed/backfill", methods=["POST"])
@@ -3328,8 +3394,23 @@ def api_live_backfill():
     cfg = get_live_cfg()
     if not cfg["enabled"] or not cfg["channel_id"]:
         return jsonify({"error": "पहले Live feed ON करके channel ID save करें"}), 400
-    threading.Thread(target=backfill_live_feed, daemon=True).start()
+    if not start_backfill_job():
+        return jsonify({"error": "पहले से भेजा जा रहा है"}), 409
     return jsonify({"status": "started"})
+
+@app.route("/dashboard/api/live-feed/status")
+@require_auth
+def api_live_status():
+    return jsonify(live_job_snapshot())
+
+@app.route("/dashboard/api/live-feed/stop", methods=["POST"])
+@require_auth
+def api_live_stop():
+    with LIVE_JOB_LOCK:
+        if LIVE_JOB["status"] not in ("running", "stopping"):
+            return jsonify({"error": "कुछ चल नहीं रहा"}), 400
+        LIVE_JOB.update(stop=True, status="stopping")
+    return jsonify({"status": "stopping"})
 
 @app.route("/dashboard/api/purchases", methods=["DELETE"])
 @require_auth
@@ -3911,6 +3992,30 @@ function purchasesHtml(uid, list){
   }).join("");
 }
 
+let feedPolling = false;
+function renderFeedJob(j){
+  if(!j || j.status === "idle") return `<div class="muted" style="font-size:13px">No sending in progress.</div>`;
+  const labels = {running: "Sending past purchases…", stopping: "Stopping…", done: "Finished", stopped: "Stopped", error: "Error"};
+  const pct = j.percent || 0;
+  const running = j.status === "running" || j.status === "stopping";
+  return `<div class="meta" style="margin-bottom:6px"><b>${esc(labels[j.status] || j.status)}</b> · ${j.done + j.failed} of ${j.total} (${pct}%) · sent ${j.done} · failed ${j.failed}${j.message ? " · " + esc(j.message) : ""}</div>
+    <div style="background:var(--surface-3);border-radius:8px;height:10px;overflow:hidden"><div style="width:${pct}%;height:100%;background:#3b82f6;transition:width .4s"></div></div>
+    ${running && j.status === "running" ? `<div style="display:flex;justify-content:flex-end;margin-top:10px"><button class="btn danger sm" data-act="stop-feed">Stop sending</button></div>` : ""}`;
+}
+async function pollFeedJob(){
+  const el = document.getElementById("feed-job");
+  if(!el) { feedPolling = false; return; }
+  if(feedPolling) return;
+  feedPolling = true;
+  try{
+    const j = await api("/dashboard/api/live-feed/status");
+    const box = document.getElementById("feed-job");
+    if(box) box.innerHTML = renderFeedJob(j);
+    if(box && (j.status === "running" || j.status === "stopping")) { feedPolling = false; setTimeout(pollFeedJob, 2000); return; }
+  }catch(e){ /* ignore, try again on next render */ }
+  feedPolling = false;
+}
+
 const RENDER = {
   appupdate: c => {
     if(!c.configured){
@@ -3993,10 +4098,12 @@ const RENDER = {
           <div class="field"><label>Share button link</label><input id="live-share-link" placeholder="https://t.me/+..." value="${esc(live.share_link)}"></div>
         </div>
         <div class="note" style="margin-top:12px"><b>Before turning this on:</b> add the bot as an <b>admin</b> of the feed channel, with permission to post messages. Use the channel ID (it starts with -100), not the invite link. When you save a new channel ID, all past purchases are sent to it automatically.</div>
+        <div id="feed-job" style="margin-top:14px"></div>
         <div style="display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:12px">
           <button class="btn ghost" data-act="backfill-feed">Send past purchases again</button>
           <button class="btn primary" data-act="save-menu">Save feed & teaser</button></div>
       </div>`;
+    pollFeedJob();
   },
 
   bans: list => {
@@ -4393,14 +4500,18 @@ const ACTIONS = {
              share_text: $("#live-share-text").value, share_link: $("#live-share-link").value.trim()},
     };
     const r = await api("/dashboard/api/menu-config", {method: "POST", body});
-    toast(r && r.backfill ? "Saved. Past purchases are being sent to the feed." : "Saved");
+    toast(r && r.backfill === "started" ? "Saved. Past purchases are being sent to the feed." : "Saved");
     delete cache.menu; loadView(true);
   },
   "backfill-feed": async () => {
-    const ok = await confirmBox({title: "Share old purchases to the feed?", text: "Every purchase that has not been posted yet will be sent to the feed channel, one by one. This can take a few minutes.", okText: "Start", danger: false});
+    const ok = await confirmBox({title: "Send past purchases to the feed?", text: "Every purchase that has not been posted yet goes to the feed channel, one by one. You can stop it any time.", okText: "Start", danger: false});
     if(!ok) return;
     await api("/dashboard/api/live-feed/backfill", {method: "POST"});
-    toast("Sending in background"); delete cache.menu;
+    toast("Sending started"); feedPolling = false; pollFeedJob();
+  },
+  "stop-feed": async () => {
+    await api("/dashboard/api/live-feed/stop", {method: "POST"});
+    toast("Stopping after the current message"); feedPolling = false; pollFeedJob();
   },
   "create-offer": async () => {
     const max = +$("#off-max").value, pu = +$("#off-peruser").value;
