@@ -862,7 +862,8 @@ def handle_menu_action(user_id, btn, first_name):
         m = InlineKeyboardMarkup().row(kbtn(btn["text"], url=btn["value"]))
         orig_send_message(user_id, "👇", reply_markup=m)
     elif act == "message" and btn.get("value"):
-        orig_send_message(user_id, btn["value"], parse_mode="HTML")
+        try: orig_send_message(user_id, btn["value"], parse_mode="HTML")
+        except Exception: orig_send_message(user_id, re.sub(r"<[^>]*>", "", btn["value"]))
 
 def get_footer_text():
     saved = get_cached_setting("menu_cfg") or {}
@@ -1306,6 +1307,7 @@ ADMIN_CATEGORIES = {
         ("🎨 Customize Start Menu", "admin_custom_menu"),
         ("🌍 Custom International Button", "admin_custom_intl"),
         ("🔘 Global Course Buttons", "admin_global_cbtns"),
+        ("📱 Bottom Menu Buttons", "admin_menu_btns"),
     ]),
     "delivery": ("🎉 Delivery & Files", [
         ("🎉 Post-Purchase Setup", "admin_success_msg"),
@@ -1327,6 +1329,18 @@ def admin_home_markup():
 
 def send_admin_panel(chat_id):
     bot.send_message(chat_id, ADMIN_HOME_TEXT, reply_markup=admin_home_markup(), parse_mode="HTML")
+
+def show_menu_btns(chat_id, msg_id):
+    btns = get_menu_cfg()
+    kinds = {"my_orders": "My Order List", "link": "link", "message": "message"}
+    lines = [f"{i + 1}. {esc_html(b['text'])} <i>({kinds.get(b.get('action'), '')})</i>" for i, b in enumerate(btns)]
+    txt = "📱 <b>Bottom Menu Buttons</b>\n\n" + ("\n".join(lines) if lines else "अभी कोई बटन नहीं है।")
+    m = InlineKeyboardMarkup()
+    for i, b in enumerate(btns):
+        m.row(InlineKeyboardButton(f"🗑 {b['text'][:40]}", callback_data=f"menubtn_del_{i}"))
+    m.row(InlineKeyboardButton("➕ Add button", callback_data="menubtn_add"))
+    m.row(InlineKeyboardButton("🔙 Back", callback_data="admin_cat_menus"))
+    bot.edit_message_text(txt, chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
 
 def show_admin_category(chat_id, msg_id, key):
     title, items = ADMIN_CATEGORIES[key]
@@ -1727,6 +1741,23 @@ def handle_all_messages(message):
                  .row(InlineKeyboardButton("♾ Permanent", callback_data="ban_dur_perm")))
             bot.send_message(chat_id, "⏱ <b>कितने समय के लिए ban करें?</b>", reply_markup=m, parse_mode="HTML")
             return
+        elif step == "MBTN_NAME":
+            name = message.text.strip()[:64]
+            if not name: return bot.send_message(chat_id, "❌ Button name खाली नहीं हो सकता।", parse_mode="HTML")
+            admin_data[chat_id]["mbtn_name"] = name
+            admin_data[chat_id]["step"] = "MBTN_TEXT"
+            bot.send_message(chat_id, "✏️ <b>अब वो text भेजें</b> जो बटन दबाने पर जाए.\nBold, link वगैरह Telegram के formatting से लगाकर भेज सकते हैं।", parse_mode="HTML")
+            return
+        elif step == "MBTN_TEXT":
+            body = get_formatted_text(message).strip()
+            if not body: return bot.send_message(chat_id, "❌ Text खाली नहीं हो सकता।", parse_mode="HTML")
+            name = admin_data[chat_id].pop("mbtn_name", "Button")
+            admin_data.pop(chat_id, None)
+            buttons = get_menu_cfg() + [{"text": name, "action": "message", "value": body[:2000]}]
+            settings_col.update_one({"_id": "menu_cfg"}, {"$set": {"buttons": buttons, "updated_at": get_ist_time()}}, upsert=True)
+            invalidate_cache("menu_cfg")
+            bot.send_message(chat_id, f"✅ <b>Button added:</b> {name}", parse_mode="HTML")
+            return
         elif step == "SUCC_SET_TEXT":
             admin_data[chat_id]["text"] = get_formatted_text(message)
             admin_data[chat_id]["buttons"] = []
@@ -1965,7 +1996,7 @@ def handle_all_messages(message):
 
 # ये prefixes सिर्फ admins के लिए हैं (user-facing बटन इनमें नहीं आते)
 ADMIN_ONLY_PREFIXES = (
-    "admin_", "ban_", "unban_", "back_to_admin", "flash_", "gcbtn_", "succ_", "intl_", "menu_", "batch_",
+    "admin_", "ban_", "unban_", "menubtn_", "back_to_admin", "flash_", "gcbtn_", "succ_", "intl_", "menu_", "batch_",
     "bc_", "ftl_", "offtarget_", "ctype_", "plan_", "next_price", "skip_caption",
     "skip_course_buttons", "ch_app_", "ch_can_", "man_appr_", "man_deny_",
 )
@@ -2102,6 +2133,24 @@ def handle_buttons(call):
         threading.Thread(target=_bg_paydone, daemon=True).start()
         return
 
+    if data == "admin_menu_btns":
+        show_menu_btns(chat_id, msg_id)
+        return
+    if data == "menubtn_add":
+        admin_data[chat_id] = {"step": "MBTN_NAME"}
+        bot.edit_message_text("✏️ <b>Step 1:</b> बटन का नाम भेजें (जैसे 📋 Help)", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+        return
+    if data.startswith("menubtn_del_"):
+        try: idx = int(data.replace("menubtn_del_", ""))
+        except ValueError: return
+        buttons = get_menu_cfg()
+        if 0 <= idx < len(buttons):
+            removed = buttons.pop(idx)
+            settings_col.update_one({"_id": "menu_cfg"}, {"$set": {"buttons": buttons, "updated_at": get_ist_time()}}, upsert=True)
+            invalidate_cache("menu_cfg")
+            bot.answer_callback_query(call.id, f"Deleted: {removed.get('text', '')}")
+        show_menu_btns(chat_id, msg_id)
+        return
     if data == "admin_ban_menu":
         m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚫 Ban user", callback_data="ban_start")).row(InlineKeyboardButton("✅ Unban user", callback_data="unban_start")).row(InlineKeyboardButton("🔙 Back", callback_data="back_to_admin"))
         bot.edit_message_text("🚫 <b>Ban / Unban</b>\nUser ID या @username से ban या unban करें।", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
@@ -4304,25 +4353,16 @@ const ACTIONS = {
     toast("Reset done"); delete cache.delivery; loadView(true);
   },
   "menu-add": () => openModal("Add a bottom button", `
-      <div class="field"><label>Button name (what customers see)</label><input id="mb-name" placeholder="📋 My Order List"></div>
-      <div class="field"><label>Action (what happens on tap)</label>
-        <select id="mb-action">
-          <option value="my_orders">Show My Order List</option>
-          <option value="link">Open a link</option>
-          <option value="message">Send a message</option>
-        </select></div>
-      <div class="field"><label>Value (only for link or message)</label><input id="mb-value" placeholder="https://t.me/+xxxx  or  your message text"></div>
-      <div class="note" style="margin-top:10px"><b>How it works:</b><br>
-        • <b>Show My Order List:</b> leave value empty. The customer sees their purchases.<br>
-        • <b>Open a link:</b> value = a full link starting with https://. It opens when tapped.<br>
-        • <b>Send a message:</b> value = the text the bot replies with (HTML bold tags work).</div>`,
+      <div class="field"><label>1. Button name (what customers see)</label><input id="mb-name" placeholder="📋 Help"></div>
+      <div class="field"><label>2. Text to send when tapped</label><textarea id="mb-value" placeholder="Type the message the bot should send. Bold works with &lt;b&gt;bold&lt;/b&gt;."></textarea></div>
+      <p class="sub-h">When a customer taps this button, the bot sends exactly this text.</p>
+      <div class="note"><b>Formatting:</b><br>Bold: <code>&lt;b&gt;bold text&lt;/b&gt;</code><br>Clickable link: <code>&lt;a href="https://example.com"&gt;click here&lt;/a&gt;</code></div>`,
       {foot: `<button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn primary" data-act="menu-save-new">Add button</button>`}),
   "menu-save-new": async () => {
-    const name = $("#mb-name").value.trim(), action = $("#mb-action").value, value = $("#mb-value").value.trim();
+    const name = $("#mb-name").value.trim(), value = $("#mb-value").value.trim();
     if(!name) return toast("Enter a button name", "err");
-    if(action === "link" && !value.startsWith("http")) return toast("Link must start with https://", "err");
-    if(action === "message" && !value) return toast("Enter the message text", "err");
-    const list = ((cache.menu && cache.menu.buttons) || []).concat([{text: name, action, value: action === "my_orders" ? "" : value}]);
+    if(!value) return toast("Enter the text to send", "err");
+    const list = ((cache.menu && cache.menu.buttons) || []).concat([{text: name, action: "message", value}]);
     await api("/dashboard/api/menu-config", {method: "POST", body: {buttons: list}});
     closeModal(); toast("Button added"); delete cache.menu; loadView(true);
   },
