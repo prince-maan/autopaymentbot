@@ -245,6 +245,7 @@ try:
     admins_col = db["admins"]  # Dashboard से जोड़े गए extra admins
     broadcasts_col = db["broadcasts"]  # Dashboard से भेजे गए broadcasts का रिकॉर्ड (हटाने के लिए)
     banned_col = db["banned_users"]  # Ban list (Dashboard + bot panel)
+    member_events_col = db["member_events"]  # join / left events (chat_member updates)
     join_prompts_col = db["join_prompts"]  # "Send request" message का रिकॉर्ड, request आने पर उसे हटाने के लिए
 
     try:
@@ -826,6 +827,134 @@ def expire_qr(chat_id, message_id, course_id, amount_key, order_id):
     try: bot.send_message(chat_id, "⏳ <b>QR Code has expired!</b>\n\nIf you have already paid, click <b>'✅ Verify Payment'</b> below.", reply_markup=markup, parse_mode="HTML", msg_type="general")
     except Exception: pass
 
+# ==========================================
+# 📱 BOTTOM MENU + MY ORDERS + LIVE FEED
+# ==========================================
+MENU_DEFAULT = [{"text": "📦 My Orders", "action": "my_orders", "value": ""}]
+
+def esc_html(s):
+    return str(s if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def get_menu_cfg():
+    saved = get_cached_setting("menu_cfg") or {}
+    btns = saved.get("buttons") if isinstance(saved.get("buttons"), list) else MENU_DEFAULT
+    return [b for b in btns if b.get("text")]
+
+def menu_markup():
+    btns = get_menu_cfg()
+    if not btns: return None
+    m = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for i in range(0, len(btns), 2):
+        m.row(*[telebot.types.KeyboardButton(b["text"]) for b in btns[i:i + 2]])
+    return m
+
+def find_menu_button(text):
+    t = (text or "").strip()
+    for b in get_menu_cfg():
+        if b["text"].strip() == t: return b
+    return None
+
+def handle_menu_action(user_id, btn, first_name):
+    act = btn.get("action")
+    if act == "my_orders":
+        send_my_orders(user_id, first_name)
+    elif act == "link" and str(btn.get("value", "")).startswith("http"):
+        m = InlineKeyboardMarkup().row(kbtn(btn["text"], url=btn["value"]))
+        orig_send_message(user_id, "👇", reply_markup=m)
+    elif act == "message" and btn.get("value"):
+        orig_send_message(user_id, btn["value"], parse_mode="HTML")
+
+def send_my_orders(user_id, first_name):
+    lines = [f"👤 <b>{esc_html(first_name or 'User')}</b>", f"🆔 <code>{user_id}</code>", ""]
+    purchases = list(purchases_col.find({"user_id": user_id}).sort("_id", 1))
+    lines.append(f"🛍 <b>Your purchases: {len(purchases)}</b>")
+    if not purchases: lines.append("• No purchases yet.")
+    course_ids = []
+    for i, p in enumerate(purchases[:15], 1):
+        cid = str(p.get("item_info", "")).split(" | ")[0]
+        if cid and cid not in course_ids: course_ids.append(cid)
+        lines.append(f"{i}. <b>{esc_html(p.get('title') or cid)}</b>\n    🆔 <code>{esc_html(cid)}</code> · 📅 {esc_html(p.get('date', ''))}")
+
+    pend = list(orders_col.find({"user_id": user_id, "status": {"$in": ["PENDING", "EXPIRED", "CANCELLED"]}}).sort("created_at", -1).limit(8))
+    if pend:
+        labels = {"PENDING": "⏳ Payment not verified yet", "EXPIRED": "⚠️ QR expired, not paid", "CANCELLED": "❌ Cancelled"}
+        lines += ["", "⏳ <b>Pending / problems</b>"]
+        for o in pend:
+            lines.append(f"• ₹{esc_html(o.get('amount'))} · <code>{esc_html(o.get('course_id'))}</code> · {esc_html(o.get('created_at_str', ''))}\n    {labels.get(o.get('status'), '')}")
+
+    if course_ids:
+        lines += ["", "🚪 <b>Channel history</b>"]
+        for cid in course_ids[:10]:
+            course = courses_col.find_one({"course_id": cid}, {"channel_name": 1, "title": 1, "channel_id": 1, "channel_ids": 1}) or {}
+            if not (course.get("channel_id") or course.get("channel_ids")): continue
+            label = course.get("channel_name") or course.get("title") or cid
+            evs = list(member_events_col.find({"user_id": user_id, "course_id": cid}).sort("ts", 1))
+            joined = next((e for e in evs if e.get("event") == "joined"), None)
+            left = next((e for e in reversed(evs) if e.get("event") == "left"), None)
+            if joined is None:
+                appr = channel_logs_col.find_one({"user_id": user_id, "course_id": cid, "status": "APPROVED"}, sort=[("_id", 1)])
+                if appr: joined = {"date": appr.get("date", ""), "ts": None}
+            lines.append(f"• <b>{esc_html(label)}</b>")
+            if joined is None:
+                lines.append("    ⏳ Not joined yet")
+                continue
+            lines.append(f"    ✅ Joined: {esc_html(joined.get('date', ''))}")
+            if left and (joined.get("ts") is None or left.get("ts", 0) >= joined["ts"]):
+                dur = ""
+                if joined.get("ts") and left.get("ts"):
+                    mins = int((left["ts"] - joined["ts"]) // 60)
+                    dur = f" (stayed {mins // 1440}d {(mins % 1440) // 60}h {mins % 60}m)"
+                lines.append(f"    🚪 Left: {esc_html(left.get('date', ''))}{dur}")
+            else:
+                lines.append("    🟢 Still in channel")
+
+    text = "\n".join(lines)
+    if len(text) > 3900: text = text[:3900] + "…"
+    try: orig_send_message(user_id, text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception: pass
+
+def get_live_cfg():
+    saved = get_cached_setting("live_feed_cfg") or {}
+    return {"enabled": bool(saved.get("enabled")), "channel_id": str(saved.get("channel_id", "")),
+            "share_text": saved.get("share_text") or "🔗 Join & Buy", "share_link": saved.get("share_link", ""),
+            "backfilled_at": saved.get("backfilled_at", "")}
+
+def purchase_amount(p):
+    m = re.search(r"Rate: ₹([\d.]+)", str(p.get("item_info", "")))
+    return m.group(1) if m else ""
+
+def post_live_feed(name, amount, channel_label, date_str):
+    """Public feed में सिर्फ़ नाम, amount, channel और तारीख. कोई link या chat वाला tag नहीं."""
+    cfg = get_live_cfg()
+    if not cfg["enabled"] or not cfg["channel_id"]: return False
+    text = (f"🔥 <b>NEW PURCHASE</b> 🔥\n\n"
+            f"✅ <b>PAYMENT DONE · ADDED TO CHANNEL</b>\n\n"
+            f"👤 <b>{esc_html(name)}</b>\n"
+            f"💰 Amount: <b>₹{esc_html(amount)}</b>\n"
+            f"📺 Channel: <b>{esc_html(channel_label)}</b>\n"
+            f"📅 {esc_html(date_str)}")
+    markup = None
+    if cfg["share_link"].startswith("http"):
+        markup = InlineKeyboardMarkup().row(kbtn(cfg["share_text"], url=cfg["share_link"]))
+    try:
+        orig_send_message(int(cfg["channel_id"]), text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+        return True
+    except Exception as e:
+        print(f"⚠️ live feed post failed: {e}", flush=True)
+        return False
+
+def backfill_live_feed():
+    """पुरानी purchases (जो अभी तक feed में नहीं गईं) एक-एक करके feed में भेजो"""
+    for p in purchases_col.find({"feed_posted": {"$ne": True}}).sort("_id", 1):
+        cid = str(p.get("item_info", "")).split(" | ")[0]
+        course = courses_col.find_one({"course_id": cid}, {"channel_name": 1, "title": 1}) or {}
+        label = course.get("channel_name") or p.get("title") or course.get("title") or cid
+        ok = post_live_feed(_strip_html(p.get("username", "")) or "Customer", purchase_amount(p), label, p.get("date", ""))
+        if ok: purchases_col.update_one({"_id": p["_id"]}, {"$set": {"feed_posted": True}})
+        time.sleep(3.2)  # Telegram: एक group/channel में लगभग 20 messages प्रति मिनट
+    settings_col.update_one({"_id": "live_feed_cfg"}, {"$set": {"backfilled_at": get_ist_time()}}, upsert=True)
+    invalidate_cache("live_feed_cfg")
+
 SUCC_DEFAULTS = {
     "header": "🎉 <b>Payment Successful!</b>",
     "between": "",
@@ -939,6 +1068,9 @@ def deliver_course_to_buyer(order, sms_text=None, is_manual=False):
     
     def _bg_log():
         purchases_col.insert_one({"user_id": user_id, "username": order.get("user_mention", f"User ({user_id})"), "item_info": f"{course_id} | Rate: ₹{order['amount']} | {verify_type} (order {order_id})", "date": date_now, "title": course.get('title', course_id), "link": course.get('secret_text', '')})
+        if not is_channel:
+            fp = purchases_col.find_one_and_update({"user_id": user_id, "date": date_now, "feed_posted": {"$ne": True}}, {"$set": {"feed_posted": True}})
+            if fp: post_live_feed(_strip_html(order.get("user_mention", "")) or "Customer", order.get("amount"), course.get("title") or course_id, date_now)
         if order.get("offer_id"):
             offers_col.update_one({"offer_code": order["offer_id"]}, {"$inc": {"used_count": 1}})
             fresh_offer = offers_col.find_one({"offer_code": order["offer_id"]})
@@ -959,6 +1091,25 @@ def deliver_course_to_buyer(order, sms_text=None, is_manual=False):
 # ==========================================
 # 🛑 GATEKEEPER: JOIN REQUEST HANDLER
 # ==========================================
+def handle_chat_member(update):
+    """Channel में कौन join हुआ और कौन left हुआ, उसका रिकॉर्ड (My Orders की history के लिए)"""
+    try:
+        if update.new_chat_member.user.is_bot: return
+        chat_id = update.chat.id
+        uid = update.new_chat_member.user.id
+        was_in = update.old_chat_member.status in ("member", "administrator", "creator", "restricted")
+        now_in = update.new_chat_member.status in ("member", "administrator", "creator", "restricted")
+        if was_in == now_in: return
+        course = courses_col.find_one({"$or": [{"channel_id": chat_id}, {"channel_ids": chat_id}]}, {"course_id": 1})
+        if not course: return
+        member_events_col.insert_one({"user_id": uid, "course_id": course["course_id"], "chat_id": chat_id,
+                                      "event": "joined" if now_in else "left", "date": get_ist_time(), "ts": time.time()})
+    except Exception as e:
+        print(f"⚠️ chat_member error: {e}", flush=True)
+
+if hasattr(bot, "chat_member_handler"):
+    bot.chat_member_handler()(handle_chat_member)
+
 @bot.chat_join_request_handler()
 def handle_join_request(message):
     chat_id = message.chat.id
@@ -994,6 +1145,10 @@ def handle_join_request(message):
             def _bg_log_ap():
                 channel_logs_col.insert_one({"user_id": user_id, "first_name": u_first_name, "username": u_username, "course_id": course_id, "channel_name": channel_name, "status": "APPROVED", "date": now_str})
             threading.Thread(target=_bg_log_ap, daemon=True).start()
+            try:
+                fp = purchases_col.find_one_and_update({"_id": purchase["_id"], "feed_posted": {"$ne": True}}, {"$set": {"feed_posted": True}})
+                if fp: threading.Thread(target=post_live_feed, args=(u_first_name, purchase_amount(purchase), channel_name, now_str), daemon=True).start()
+            except Exception: pass
             prompt = join_prompts_col.find_one_and_delete({"user_id": user_id, "course_id": course_id})
             if prompt:
                 try: bot.delete_message(prompt.get("chat_id", user_id), prompt.get("msg_id"))
@@ -1205,6 +1360,9 @@ def start_command(message):
     if not check_rate_limit(user_id, 1): return
     register_activity(user_id, message.message_id, "general")
     
+    mk = menu_markup()
+    if mk: orig_send_message(user_id, "👇", reply_markup=mk)
+
     def _bg_start():
         try: users_col.update_one({"user_id": user_id}, {"$set": {"user_id": user_id, "username": message.from_user.username or "", "updated_at": get_ist_time()}}, upsert=True)
         except: pass
@@ -1314,6 +1472,11 @@ def handle_all_messages(message):
         orig_send_message(user_id, "⚠ <b>Bot is currently under maintenance.</b>\nServers are busy or undergoing updates. Please try again after some time.", parse_mode="HTML")
         return
     if is_banned(user_id, getattr(message.from_user, "username", None)): return
+    if message.content_type == "text" and not (is_admin(user_id) and user_id in admin_data):
+        mb = find_menu_button(message.text)
+        if mb:
+            handle_menu_action(user_id, mb, getattr(message.from_user, "first_name", ""))
+            return
     if not check_rate_limit(user_id, 1): return
     register_activity(user_id, message.message_id, "general")
 
@@ -3014,6 +3177,70 @@ def api_success_msg():
         return jsonify({"status": "success"})
     return jsonify(get_success_cfg())
 
+def _parse_menu_lines(txt):
+    out = []
+    for line in str(txt or "").splitlines():
+        if not line.strip(): continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 2 or not parts[0]: raise ValueError(f"गलत लाइन: {line.strip()[:60]}")
+        text, act = parts[0][:64], parts[1].lower()
+        val = parts[2] if len(parts) > 2 else ""
+        if act in ("orders", "my orders", "my_orders"):
+            out.append({"text": text, "action": "my_orders", "value": ""})
+        elif act == "link":
+            if not val.startswith("http"): raise ValueError(f"'{text}': link https:// से शुरू होना चाहिए")
+            out.append({"text": text, "action": "link", "value": val})
+        elif act == "message":
+            if not val: raise ValueError(f"'{text}': message खाली नहीं हो सकता")
+            out.append({"text": text, "action": "message", "value": val[:2000]})
+        else:
+            raise ValueError(f"'{text}': action 'orders', 'link' या 'message' होना चाहिए")
+    if len(out) > 12: raise ValueError("Maximum 12 buttons")
+    return out
+
+@app.route("/dashboard/api/menu-config", methods=["GET", "POST"])
+@require_auth
+def api_menu_config():
+    if request.method == "POST":
+        d = request.json or {}
+        try: buttons = _parse_menu_lines(d.get("menu_text", ""))
+        except ValueError as e: return jsonify({"error": str(e)}), 400
+        lv = d.get("live") or {}
+        enabled = bool(lv.get("enabled"))
+        ch = str(lv.get("channel_id", "")).strip()
+        if enabled and not re.fullmatch(r"-?\d{6,}", ch):
+            return jsonify({"error": "Feed channel ID सिर्फ़ numbers में डालें (जैसे -1001234567890)"}), 400
+        link = str(lv.get("share_link", "")).strip()
+        if link and not link.startswith("http"):
+            return jsonify({"error": "Share link https:// से शुरू होना चाहिए"}), 400
+        old_live = get_live_cfg()
+        settings_col.update_one({"_id": "menu_cfg"}, {"$set": {"buttons": buttons, "updated_at": get_ist_time()}}, upsert=True)
+        settings_col.update_one({"_id": "live_feed_cfg"}, {"$set": {
+            "enabled": enabled, "channel_id": ch, "share_text": str(lv.get("share_text", "")).strip()[:64] or "🔗 Join & Buy",
+            "share_link": link, "updated_at": get_ist_time()}}, upsert=True)
+        invalidate_cache("menu_cfg"); invalidate_cache("live_feed_cfg")
+        if enabled and ch and ch != old_live["channel_id"]:
+            # नया feed channel: पुरानी सारी purchases उसमें अपने-आप जाएँगी
+            purchases_col.update_many({}, {"$unset": {"feed_posted": ""}})
+            threading.Thread(target=backfill_live_feed, daemon=True).start()
+            return jsonify({"status": "success", "backfill": "started"})
+        return jsonify({"status": "success"})
+    lines = []
+    for b in get_menu_cfg():
+        act = {"my_orders": "orders", "link": "link", "message": "message"}.get(b.get("action"), "message")
+        lines.append(f"{b['text']} | {act} | {b.get('value', '')}".rstrip(" |"))
+    lv = get_live_cfg()
+    return jsonify({"menu_text": "\n".join(lines), "live": lv})
+
+@app.route("/dashboard/api/live-feed/backfill", methods=["POST"])
+@require_auth
+def api_live_backfill():
+    cfg = get_live_cfg()
+    if not cfg["enabled"] or not cfg["channel_id"]:
+        return jsonify({"error": "पहले Live feed ON करके channel ID save करें"}), 400
+    threading.Thread(target=backfill_live_feed, daemon=True).start()
+    return jsonify({"status": "started"})
+
 @app.route("/dashboard/api/purchases", methods=["DELETE"])
 @require_auth
 def api_remove_purchase():
@@ -3484,14 +3711,14 @@ const NAV = [
   ["Overview", [["home", "Dashboard", "users"]]],
   ["Sales", [["orders", "Orders", "check"], ["users", "Users & purchases", "users"], ["bans", "Ban list", "users"]]],
   ["Store", [["courses", "Courses", "check"], ["delivery", "Post-purchase message", "check"], ["offers", "Offers", "check"], ["logs", "Channel logs", "check"]]],
-  ["Messaging", [["broadcast", "Broadcast", "check"], ["sms", "SMS pool & trigger", "check"]]],
+  ["Messaging", [["broadcast", "Broadcast", "check"], ["menu", "Menu & live feed", "check"], ["sms", "SMS pool & trigger", "check"]]],
   ["System", [["setup", "Bot setup", "check"], ["appupdate", "App update", "check"], ["settings", "Bot settings", "check"]]],
 ];
 const TITLES = {home: "Dashboard", orders: "Orders", users: "Users & purchases", courses: "Courses", offers: "Offers",
-  bans: "Ban list", delivery: "Post-purchase message", logs: "Channel logs", broadcast: "Broadcast", sms: "SMS pool & trigger", settings: "Bot settings", setup: "Bot setup", search: "Search"};
+  menu: "Menu & live feed", bans: "Ban list", delivery: "Post-purchase message", logs: "Channel logs", broadcast: "Broadcast", sms: "SMS pool & trigger", settings: "Bot settings", setup: "Bot setup", search: "Search"};
 const SUBS = {home: "Overview of today's store activity.", orders: "Approve or cancel payment requests.",
   users: "Every user and the courses they bought.", courses: "Browse, inspect and remove packs.",
-  bans: "Block users by ID or @username, for a set time or forever.", delivery: "Text and buttons shown right after a payment.", offers: "Discount links for customers.", logs: "Channel join requests.", broadcast: "Message all users, and remove sent messages.",
+  menu: "Bottom buttons in the bot and the public live purchase feed.", bans: "Block users by ID or @username, for a set time or forever.", delivery: "Text and buttons shown right after a payment.", offers: "Discount links for customers.", logs: "Channel join requests.", broadcast: "Message all users, and remove sent messages.",
   sms: "Bank SMS pool and manual payment trigger.", settings: "Maintenance and auto-clean options.", setup: "MongoDB link, bot token, IDs and payment details. Saving restarts the bot."};
 
 function buildNav(){
@@ -3531,6 +3758,7 @@ const SHELL = {
     <div class="form-grid"><div class="field"><label>Amount</label><input id="inj-amt" placeholder="50.01" inputmode="decimal"></div>
     <div><button class="btn primary" data-act="inject">Trigger</button></div></div></div><div id="list"></div>`,
   bans: () => `<div id="list"></div>`,
+  menu: () => `<div id="list"></div>`,
   delivery: () => `<div id="list"></div>`,
   settings: () => `<div id="list"></div>`,
   setup: () => `<div id="list"></div>`,
@@ -3552,6 +3780,7 @@ const FETCH = {
   sms: () => api("/dashboard/api/sms-pool"),
   settings: () => api("/dashboard/api/system-settings"),
   bans: () => api("/dashboard/api/bans"),
+  menu: () => api("/dashboard/api/menu-config"),
   delivery: () => api("/dashboard/api/success-msg"),
   setup: () => api("/dashboard/api/config"),
   appupdate: () => api("/dashboard/api/app-update"),
@@ -3647,6 +3876,29 @@ const RENDER = {
       <div class="user-head"><div><span class="name">@${esc(u.username || "none")}</span> <span class="mono dim">${esc(u.user_id)}</span></div>
       <span class="pill">${u.purchases.length} course${u.purchases.length === 1 ? "" : "s"}</span></div>
       ${purchasesHtml(u.user_id, u.purchases)}</div>`).join("") : empty("No users found.");
+  },
+
+  menu: c => {
+    const live = c.live || {};
+    $("#list").innerHTML = `
+      <div class="card"><h3>Bottom menu buttons</h3>
+        <p class="sub-h">These buttons appear at the bottom of the bot chat. One per line: <code>Button text | action | value</code></p>
+        <p class="sub-h"><b>orders</b> shows the My Orders screen (no value needed) · <b>link</b> opens a web link (value = https://...) · <b>message</b> sends your text (value = the message).</p>
+        <textarea id="menu-lines" style="min-height:150px" placeholder="📦 My Orders | orders&#10;🔴 Live Purchases | link | https://t.me/+xxxx&#10;💬 Help | message | Contact admin: @yourname">${esc(c.menu_text)}</textarea>
+        <p class="sub-h" style="margin-top:8px">Changes apply after the customer sends /start again.</p></div>
+      <div class="card"><h3>Live purchase feed</h3>
+        <p class="sub-h">Posts every new paid purchase to a public channel. It shows only the buyer's name, amount, channel name and date. There is no link to the buyer, so nobody can open a chat with them from the feed.</p>
+        <div class="toggle-row"><div class="lbl">Live feed on<small>Needs the channel ID below</small></div><input type="checkbox" id="live-on" ${live.enabled ? "checked" : ""}></div>
+        <div class="form-grid" style="margin-top:12px">
+          <div class="field"><label>Feed channel ID</label><input id="live-channel" placeholder="-1001234567890" value="${esc(live.channel_id)}"></div>
+          <div class="field"><label>Share button text</label><input id="live-share-text" value="${esc(live.share_text)}"></div>
+          <div class="field"><label>Share button link</label><input id="live-share-link" placeholder="https://t.me/+..." value="${esc(live.share_link)}"></div>
+        </div>
+        <div class="note" style="margin-top:12px"><b>Before turning this on:</b> add the bot as an <b>admin</b> of the feed channel, with permission to post messages. Use the channel ID (it starts with -100), not the invite link.</div>
+        <div style="display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:12px">
+          <button class="btn ghost" data-act="backfill-feed">${live.backfilled_at ? "Share old purchases again" : "Share old purchases to feed"}</button>
+          <button class="btn primary" data-act="save-menu">Save menu & feed</button></div>
+      </div>`;
   },
 
   bans: list => {
@@ -4013,6 +4265,21 @@ const ACTIONS = {
     if(!ok) return;
     await api("/dashboard/api/success-msg", {method: "POST", body: {reset: true}});
     toast("Reset done"); delete cache.delivery; loadView(true);
+  },
+  "save-menu": async () => {
+    const body = {
+      menu_text: $("#menu-lines").value,
+      live: {enabled: $("#live-on").checked, channel_id: $("#live-channel").value.trim(),
+             share_text: $("#live-share-text").value, share_link: $("#live-share-link").value.trim()},
+    };
+    await api("/dashboard/api/menu-config", {method: "POST", body});
+    toast("Menu and feed saved"); delete cache.menu; loadView(true);
+  },
+  "backfill-feed": async () => {
+    const ok = await confirmBox({title: "Share old purchases to the feed?", text: "Every purchase that has not been posted yet will be sent to the feed channel, one by one. This can take a few minutes.", okText: "Start", danger: false});
+    if(!ok) return;
+    await api("/dashboard/api/live-feed/backfill", {method: "POST"});
+    toast("Sending in background"); delete cache.menu;
   },
   "create-offer": async () => {
     const max = +$("#off-max").value, pu = +$("#off-peruser").value;
@@ -4649,7 +4916,8 @@ def start_polling():
     while True:
         try:
             bot.remove_webhook()
-            bot.infinity_polling(timeout=20, long_polling_timeout=15, skip_pending=True, logger_level=None)
+            bot.infinity_polling(timeout=20, long_polling_timeout=15, skip_pending=True, logger_level=None,
+                                 allowed_updates=["message", "callback_query", "chat_join_request", "chat_member"])
         except Exception:
             time.sleep(5)
 
