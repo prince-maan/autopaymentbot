@@ -870,7 +870,7 @@ def get_footer_text():
 
 def send_my_orders(user_id, first_name):
     purchases = list(purchases_col.find({"user_id": user_id}).sort("_id", 1))
-    info_cache, join_cache = {}, {}
+    info_cache = {}
 
     def label(cid):
         if cid not in info_cache:
@@ -878,38 +878,35 @@ def send_my_orders(user_id, first_name):
             info_cache[cid] = c.get("channel_name") or c.get("title") or cid
         return info_cache[cid]
 
-    def joined(cid):
-        if cid not in join_cache:
-            ev = member_events_col.find_one({"user_id": user_id, "course_id": cid, "event": "joined"}, sort=[("ts", 1)])
-            if ev: join_cache[cid] = ev.get("date", "")
-            else:
-                ap = channel_logs_col.find_one({"user_id": user_id, "course_id": cid, "status": "APPROVED"}, sort=[("_id", 1)])
-                join_cache[cid] = ap.get("date", "") if ap else ""
-        return join_cache[cid]
-
     lines = ["📋 <b>MY ORDER LIST</b>", "━━━━━━━━━━━━━━", "",
              f"👤 <b>{esc_html(first_name or 'User')}</b>",
-             f"🛍 Total purchases: <b>{len(purchases)}</b>", ""]
+             f"🛍 Total purchases: <b>{len(purchases)}</b>", "",
+             "💸 <b>My purchases :-</b>", ""]
     if not purchases:
         lines.append("You have no purchases yet.")
     for i, p in enumerate(purchases[:20], 1):
         cid = str(p.get("item_info", "")).split(" | ")[0]
-        jd = joined(cid)
-        lines.append(f"<b>{i}. {esc_html(label(cid))}</b>\n    📅 Joined: {esc_html(jd) if jd else 'Not joined yet'}")
+        lines += [f"<b>{i}. Order :-</b>",
+                  f"   📡 Channel : {esc_html(label(cid))}",
+                  f"   💰 Amount : ₹{esc_html(purchase_amount(p))}",
+                  f"   🗓️ Date : {esc_html(p.get('date', ''))}", ""]
 
-    activity = []
-    for p in purchases[-10:]:
-        cid = str(p.get("item_info", "")).split(" | ")[0]
-        activity.append(f"🛒 {esc_html(label(cid))} · purchased {esc_html(p.get('date', ''))}")
-    for e in member_events_col.find({"user_id": user_id, "event": "left"}).sort("ts", -1).limit(10):
-        activity.append(f"🚪 {esc_html(label(e.get('course_id', '')))} · left {esc_html(e.get('date', ''))}")
-    if activity:
-        lines += ["", "━━━━━━━━━━━━━━", "🕘 <b>Activity</b>"] + [f"• {a}" for a in activity]
+    # Left section: सिर्फ़ उन channels का, जिनसे यूज़र अभी बाहर है (latest event = left)
+    last = {}
+    for e in member_events_col.find({"user_id": user_id}).sort("ts", 1):
+        last[e.get("course_id")] = e
+    left = sorted([e for e in last.values() if e.get("event") == "left"], key=lambda e: e.get("ts", 0), reverse=True)
+    if left:
+        lines += ["━━━━━━━━━━━━━━", "", "🕘 <b>Channel left</b>", ""]
+        for i, e in enumerate(left[:20], 1):
+            lines += [f"<b>{i}. Channel left :-</b>",
+                      f"   📡 Channel : {esc_html(label(e.get('course_id', '')))}",
+                      f"   🗓️ Date : {esc_html(e.get('date', ''))}", ""]
 
     footer = get_footer_text()
-    if footer: lines += ["", footer]
+    if footer: lines += [footer]
 
-    text = "\n".join(lines)
+    text = "\n".join(lines).rstrip()
     if len(text) > 3900: text = text[:3900] + "…"
     link = CHAT_LINK if str(CHAT_LINK).startswith(("http", "tg://")) else f"tg://user?id={ADMIN_ID}"
     markup = InlineKeyboardMarkup().row(kbtn("💬 Contact Admin", url=link))
