@@ -924,16 +924,27 @@ def purchase_amount(p):
     m = re.search(r"Rate: ₹([\d.]+)", str(p.get("item_info", "")))
     return m.group(1) if m else ""
 
-def post_live_feed(name, amount, channel_label, date_str):
-    """Public feed में सिर्फ़ नाम, amount, channel और तारीख. कोई link या chat वाला tag नहीं."""
+def feed_display_name(raw, uid):
+    """Feed में सिर्फ़ नाम: @username और (ID) हटाकर. नाम न मिले तो 'Customer N' (N स्थिर रहता है)"""
+    cleaned = re.sub(r"\(\s*\d+\s*\)", "", re.sub(r"@\w+", "", _strip_html(raw or ""))).strip()
+    if cleaned and cleaned.lower() != "user": return cleaned
+    try:
+        first = purchases_col.find_one({"user_id": uid}, sort=[("_id", 1)])
+        n = len(purchases_col.distinct("user_id", {"_id": {"$lte": first["_id"]}})) if first else 0
+    except Exception:
+        n = 0
+    return f"Customer {n or ''}".strip()
+
+def post_live_feed(name, amount, channel_label, link=""):
+    """Format: बोल्ड नाम, PAYMENT DONE + amount, channel का नाम, और course link पर 'View channel'.
+    कोई username या chat tag नहीं."""
     cfg = get_live_cfg()
     if not cfg["enabled"] or not cfg["channel_id"]: return False
-    text = (f"🔥 <b>NEW PURCHASE</b> 🔥\n\n"
-            f"✅ <b>PAYMENT DONE · ADDED TO CHANNEL</b>\n\n"
-            f"👤 <b>{esc_html(name)}</b>\n"
-            f"💰 Amount: <b>₹{esc_html(amount)}</b>\n"
-            f"📺 Channel: <b>{esc_html(channel_label)}</b>\n"
-            f"📅 {esc_html(date_str)}")
+    text = (f"🔥 <b>Customer : {esc_html(name)}</b> 🔥\n\n"
+            f"✅ <b>PAYMENT DONE · ₹{esc_html(amount)}</b>\n\n"
+            f"📺 Channel: <b>{esc_html(channel_label)}</b> - Added")
+    if str(link).startswith("http"):
+        text += f"\n\n👁️ <a href=\"{esc_html(link)}\">View channel</a>"
     markup = None
     if cfg["share_link"].startswith("http"):
         markup = InlineKeyboardMarkup().row(kbtn(cfg["share_text"], url=cfg["share_link"]))
@@ -948,9 +959,10 @@ def backfill_live_feed():
     """पुरानी purchases (जो अभी तक feed में नहीं गईं) एक-एक करके feed में भेजो"""
     for p in purchases_col.find({"feed_posted": {"$ne": True}}).sort("_id", 1):
         cid = str(p.get("item_info", "")).split(" | ")[0]
-        course = courses_col.find_one({"course_id": cid}, {"channel_name": 1, "title": 1}) or {}
+        course = courses_col.find_one({"course_id": cid}, {"channel_name": 1, "title": 1, "secret_text": 1}) or {}
         label = course.get("channel_name") or p.get("title") or course.get("title") or cid
-        ok = post_live_feed(_strip_html(p.get("username", "")) or "Customer", purchase_amount(p), label, p.get("date", ""))
+        ok = post_live_feed(feed_display_name(p.get("username", ""), p.get("user_id")), purchase_amount(p), label,
+                            extract_invite_link(course.get("secret_text", "")))
         if ok: purchases_col.update_one({"_id": p["_id"]}, {"$set": {"feed_posted": True}})
         time.sleep(3.2)  # Telegram: एक group/channel में लगभग 20 messages प्रति मिनट
     settings_col.update_one({"_id": "live_feed_cfg"}, {"$set": {"backfilled_at": get_ist_time()}}, upsert=True)
@@ -1071,7 +1083,7 @@ def deliver_course_to_buyer(order, sms_text=None, is_manual=False):
         purchases_col.insert_one({"user_id": user_id, "username": order.get("user_mention", f"User ({user_id})"), "item_info": f"{course_id} | Rate: ₹{order['amount']} | {verify_type} (order {order_id})", "date": date_now, "title": course.get('title', course_id), "link": course.get('secret_text', '')})
         if not is_channel:
             fp = purchases_col.find_one_and_update({"user_id": user_id, "date": date_now, "feed_posted": {"$ne": True}}, {"$set": {"feed_posted": True}})
-            if fp: post_live_feed(_strip_html(order.get("user_mention", "")) or "Customer", order.get("amount"), course.get("title") or course_id, date_now)
+            if fp: post_live_feed(feed_display_name(order.get("user_mention", ""), user_id), order.get("amount"), course.get("title") or course_id, extract_invite_link(course.get("secret_text", "")))
         if order.get("offer_id"):
             offers_col.update_one({"offer_code": order["offer_id"]}, {"$inc": {"used_count": 1}})
             fresh_offer = offers_col.find_one({"offer_code": order["offer_id"]})
@@ -1148,7 +1160,7 @@ def handle_join_request(message):
             threading.Thread(target=_bg_log_ap, daemon=True).start()
             try:
                 fp = purchases_col.find_one_and_update({"_id": purchase["_id"], "feed_posted": {"$ne": True}}, {"$set": {"feed_posted": True}})
-                if fp: threading.Thread(target=post_live_feed, args=(u_first_name, purchase_amount(purchase), channel_name, now_str), daemon=True).start()
+                if fp: threading.Thread(target=post_live_feed, args=(feed_display_name(u_first_name, user_id), purchase_amount(purchase), channel_name, extract_invite_link(course.get("secret_text", "")) or used_link), daemon=True).start()
             except Exception: pass
             prompt = join_prompts_col.find_one_and_delete({"user_id": user_id, "course_id": course_id})
             if prompt:
