@@ -861,9 +861,15 @@ def handle_menu_action(user_id, btn, first_name):
     elif act == "link" and str(btn.get("value", "")).startswith("http"):
         m = InlineKeyboardMarkup().row(kbtn(btn["text"], url=btn["value"]))
         orig_send_message(user_id, "👇", reply_markup=m)
-    elif act == "message" and btn.get("value"):
-        try: orig_send_message(user_id, btn["value"], parse_mode="HTML")
-        except Exception: orig_send_message(user_id, re.sub(r"<[^>]*>", "", btn["value"]))
+    elif act == "message":
+        markup = None
+        links = [l for l in (btn.get("links") or []) if str(l.get("url", "")).startswith("http")]
+        if links:
+            markup = InlineKeyboardMarkup()
+            for l in links[:8]: markup.row(kbtn(l.get("text") or "Open", url=l["url"], style=l.get("style")))
+        body = btn.get("value") or "👇"
+        try: orig_send_message(user_id, body, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+        except Exception: orig_send_message(user_id, re.sub(r"<[^>]*>", "", body), reply_markup=markup, disable_web_page_preview=True)
 
 CHAT_TITLE_CACHE = {}
 
@@ -1826,12 +1832,32 @@ def handle_all_messages(message):
         elif step == "MBTN_TEXT":
             body = get_formatted_text(message).strip()
             if not body: return bot.send_message(chat_id, "❌ Text खाली नहीं हो सकता।", parse_mode="HTML")
-            name = admin_data[chat_id].pop("mbtn_name", "Button")
+            admin_data[chat_id]["mbtn_text"] = body[:2000]
+            admin_data[chat_id]["step"] = "MBTN_LINKS"
+            bot.send_message(chat_id, "🔗 <b>Step 3:</b> Link buttons भेजें, एक लाइन में एक:\n<code>Button text - https://link</code>\nकई बटन एक साथ भेज सकते हैं। कोई link नहीं चाहिए तो <code>skip</code> भेजें।", parse_mode="HTML")
+            return
+        elif step == "MBTN_LINKS":
+            raw = (message.text or "").strip()
+            links = []
+            if raw.lower() != "skip":
+                for line in raw.splitlines():
+                    if not line.strip(): continue
+                    try:
+                        t, u, st = parse_btn_line(line)
+                    except ValueError:
+                        return bot.send_message(chat_id, "❌ Format गलत है। हर लाइन: <code>Button text - https://link</code>", parse_mode="HTML")
+                    if not u.startswith("http"):
+                        return bot.send_message(chat_id, "❌ Link https:// से शुरू होना चाहिए।", parse_mode="HTML")
+                    links.append({"text": t[:64], "url": u, "style": st})
+                if len(links) > 8:
+                    return bot.send_message(chat_id, "❌ एक message में ज़्यादा से ज़्यादा 8 link buttons।", parse_mode="HTML")
+            name = admin_data[chat_id].get("mbtn_name", "Button")
+            body = admin_data[chat_id].get("mbtn_text", "")
             admin_data.pop(chat_id, None)
-            buttons = get_menu_cfg() + [{"text": name, "action": "message", "value": body[:2000]}]
+            buttons = get_menu_cfg() + [{"text": name, "action": "message", "value": body, "links": links}]
             settings_col.update_one({"_id": "menu_cfg"}, {"$set": {"buttons": buttons, "updated_at": get_ist_time()}}, upsert=True)
             invalidate_cache("menu_cfg")
-            bot.send_message(chat_id, f"✅ <b>Button added:</b> {name}", parse_mode="HTML")
+            bot.send_message(chat_id, f"✅ <b>Button added:</b> {esc_html(name)} ({len(links)} link button{'s' if len(links) != 1 else ''})", parse_mode="HTML")
             return
         elif step == "SUCC_SET_TEXT":
             admin_data[chat_id]["text"] = get_formatted_text(message)
@@ -3395,8 +3421,15 @@ def _validate_menu_buttons(items):
             if not val.startswith("http"): raise ValueError(f"'{text}': link https:// से शुरू होना चाहिए")
             out.append({"text": text, "action": "link", "value": val})
         elif act == "message":
-            if not val: raise ValueError(f"'{text}': message खाली नहीं हो सकता")
-            out.append({"text": text, "action": "message", "value": val[:2000]})
+            links = []
+            for l in (b.get("links") or [])[:8]:
+                lt = str(l.get("text", "")).strip()[:64]
+                lu = str(l.get("url", "")).strip()
+                if not lt or not lu.startswith("http"):
+                    raise ValueError(f"'{text}': हर link button के लिए text और https:// link चाहिए")
+                links.append({"text": lt, "url": lu, "style": str(l.get("style", "")).lower()})
+            if not val and not links: raise ValueError(f"'{text}': message या कम से कम एक link चाहिए")
+            out.append({"text": text, "action": "message", "value": val[:2000], "links": links})
         else:
             raise ValueError(f"'{text}': action गलत है")
     return out
@@ -4500,6 +4533,37 @@ function go(v, push = true){
 const fadeRow = el => { const r = el && el.closest(".row, .purch"); if(r) r.classList.add("removing"); };
 const refresh = () => loadView(true);
 
+function openMenuAdd(keep){
+  const v = keep || {};
+  openModal("Add a bottom button", `
+      <div class="field"><label>1. Button name (with emoji)</label><input id="mb-name" placeholder="📋 Help" value="${esc(v.name||"")}"></div>
+      <div class="field"><label>2. Text the bot sends when tapped</label><textarea id="mb-value" placeholder="Type the message. Bold works with &lt;b&gt;bold&lt;/b&gt;.">${esc(v.text||"")}</textarea></div>
+      <div class="field"><label>3. Link buttons (optional)</label><textarea id="mb-links" placeholder="Join Channel - https://t.me/yourchannel" style="min-height:70px">${esc(v.links||"")}</textarea></div>
+      <p class="sub-h">One per line: <b>Button text - https://link</b>. Several lines = several buttons under the message. Leave empty for text only.</p>`,
+      {foot: `<button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn" data-act="menu-save-new" data-again="1">Save &amp; add another</button><button class="btn primary" data-act="menu-save-new">Save</button>`});
+}
+async function saveMenuButton(again){
+  const name = $("#mb-name").value.trim(), text = $("#mb-value").value.trim(), raw = $("#mb-links").value;
+  const keep = {name: $("#mb-name").value, text: $("#mb-value").value, links: raw};
+  if(!name) return toast("Enter a button name", "err");
+  if(!text) return toast("Enter the text the bot should send", "err");
+  const links = [];
+  for(const line of raw.split("\n").map(x => x.trim()).filter(Boolean)){
+    const i = line.lastIndexOf(" - ");
+    const lt = i > 0 ? line.slice(0, i).trim() : "", lu = i > 0 ? line.slice(i + 3).trim() : "";
+    if(!lt || !lu.startsWith("https://")) return toast("Each link line: Text - https://link", "err");
+    links.push({text: lt, url: lu, style: ""});
+  }
+  if(links.length > 8) return toast("Maximum 8 link buttons per message", "err");
+  const list = ((cache.menu && cache.menu.buttons) || []).concat([{text: name, action: "message", value: text, links}]);
+  try{
+    await api("/dashboard/api/menu-config", {method: "POST", body: {buttons: list}});
+  }catch(e){ return toast(e.message || "Could not save", "err"); }
+  delete cache.menu; loadView(true);
+  if(again){ toast("Saved. Add the next one"); openMenuAdd(); }
+  else { closeModal(); toast("Button added"); }
+}
+
 const ACTIONS = {
   "approve": async el => {
     const ok = await confirmBox({title: "Approve this payment?", text: "The customer will receive the course immediately.", okText: "Approve", danger: false});
@@ -4575,20 +4639,8 @@ const ACTIONS = {
     await api("/dashboard/api/success-msg", {method: "POST", body: {reset: true}});
     toast("Reset done"); delete cache.delivery; loadView(true);
   },
-  "menu-add": () => openModal("Add a bottom button", `
-      <div class="field"><label>1. Button name (what customers see)</label><input id="mb-name" placeholder="📋 Help"></div>
-      <div class="field"><label>2. Text to send when tapped</label><textarea id="mb-value" placeholder="Type the message the bot should send. Bold works with &lt;b&gt;bold&lt;/b&gt;."></textarea></div>
-      <p class="sub-h">When a customer taps this button, the bot sends exactly this text.</p>
-      <div class="note"><b>Formatting:</b><br>Bold: <code>&lt;b&gt;bold text&lt;/b&gt;</code><br>Clickable link: <code>&lt;a href="https://example.com"&gt;click here&lt;/a&gt;</code></div>`,
-      {foot: `<button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn primary" data-act="menu-save-new">Add button</button>`}),
-  "menu-save-new": async () => {
-    const name = $("#mb-name").value.trim(), value = $("#mb-value").value.trim();
-    if(!name) return toast("Enter a button name", "err");
-    if(!value) return toast("Enter the text to send", "err");
-    const list = ((cache.menu && cache.menu.buttons) || []).concat([{text: name, action: "message", value}]);
-    await api("/dashboard/api/menu-config", {method: "POST", body: {buttons: list}});
-    closeModal(); toast("Button added"); delete cache.menu; loadView(true);
-  },
+  "menu-add": () => openMenuAdd(),
+  "menu-save-new": async el => { await saveMenuButton(el.dataset.again === "1"); },
   "menu-del": async el => {
     const ok = await confirmBox({title: "Delete this button?", text: "Customers will no longer see it in the bot menu.", okText: "Delete"});
     if(!ok) return;
