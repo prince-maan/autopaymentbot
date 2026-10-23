@@ -935,7 +935,7 @@ def send_my_orders(user_id, first_name):
 def get_live_cfg():
     saved = get_cached_setting("live_feed_cfg") or {}
     return {"enabled": bool(saved.get("enabled")), "channel_id": str(saved.get("channel_id", "")),
-            "share_text": saved.get("share_text") or "🔗 Join & Buy", "share_link": saved.get("share_link", ""),
+            "share_text": saved.get("share_text") or "Join Now", "share_link": saved.get("share_link", ""),
             "backfilled_at": saved.get("backfilled_at", "")}
 
 def purchase_amount(p):
@@ -944,7 +944,7 @@ def purchase_amount(p):
 
 def feed_display_name(raw, uid):
     """Feed में सिर्फ़ नाम: @username और (ID) हटाकर. नाम न मिले तो 'Customer N' (N स्थिर रहता है)"""
-    cleaned = re.sub(r"\(\s*\d+\s*\)", "", re.sub(r"@\w+", "", _strip_html(raw or ""))).strip()
+    cleaned = re.sub(r"\(\s*\d*\s*\)", "", re.sub(r"@\w*", "", _strip_html(raw or ""))).strip()
     if cleaned and cleaned.lower() != "user": return cleaned
     try:
         first = purchases_col.find_one({"user_id": uid}, sort=[("_id", 1)])
@@ -960,15 +960,16 @@ def post_live_feed(name, amount, channel_label, link=""):
     text = (f"🔥 <b>Customer : {esc_html(name)}</b> 🔥\n\n"
             f"✅ <b>PAYMENT DONE · ₹{esc_html(amount)}</b>\n\n"
             f"📺 Channel: <b>{esc_html(channel_label)}</b> - Added")
-    if str(link).startswith("http"):
-        text += f"\n\n{esc_html(link)}"
+    markup = None
+    if cfg["share_link"].startswith("http"):
+        markup = InlineKeyboardMarkup().row(kbtn(cfg["share_text"] or "Join Now", url=cfg["share_link"]))
     try:
-        orig_send_message(int(cfg["channel_id"]), text, parse_mode="HTML", disable_web_page_preview=True)
+        orig_send_message(int(cfg["channel_id"]), text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
         return True
     except Exception as e:
         print(f"⚠️ live feed post failed, plain fallback: {e}", flush=True)
         try:
-            orig_send_message(int(cfg["channel_id"]), re.sub(r"<[^>]*>", "", text), disable_web_page_preview=True)
+            orig_send_message(int(cfg["channel_id"]), re.sub(r"<[^>]*>", "", text), reply_markup=markup, disable_web_page_preview=True)
             return True
         except Exception as e2:
             print(f"⚠️ live feed post failed: {e2}", flush=True)
@@ -3211,6 +3212,65 @@ def api_user_lookup():
         })
     return jsonify(out)
 
+# ==========================================
+# 📊 SERVER LOAD (Linux /proc से, कोई extra package नहीं)
+# ==========================================
+LOAD_STATE = {"supported": False, "cpu": None, "mem": None, "mem_used_mb": None, "mem_total_mb": None,
+              "bot_cpu": None, "bot_mem_mb": None, "load1": None, "ncpu": os.cpu_count() or 1, "updated": ""}
+
+def _read_cpu_total():
+    with open("/proc/stat") as f:
+        vals = [int(x) for x in f.readline().split()[1:9]]
+    return sum(vals), vals[3] + vals[4]  # total, idle (+iowait)
+
+def _read_mem():
+    info = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1); info[k] = int(v.split()[0])  # kB
+    total = info["MemTotal"]; avail = info.get("MemAvailable", info.get("MemFree", 0))
+    return round((1 - avail / total) * 100, 1), round((total - avail) / 1024), round(total / 1024)
+
+def _read_bot_proc():
+    with open("/proc/self/stat") as f:
+        fields = f.read().rsplit(")", 1)[1].split()
+    ticks = int(fields[11]) + int(fields[12])  # utime + stime
+    rss_mb = None
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"): rss_mb = round(int(line.split()[1]) / 1024, 1)
+    return ticks, rss_mb
+
+def load_sampler():
+    try: clk = os.sysconf("SC_CLK_TCK")
+    except Exception: clk = 100
+    prev = None
+    while True:
+        try:
+            tot, idle = _read_cpu_total()
+            ticks, rss = _read_bot_proc()
+            now = time.time()
+            mem_pct, used_mb, total_mb = _read_mem()
+            cpu = bot_cpu = None
+            if prev and tot > prev["tot"]:
+                cpu = round((1 - (idle - prev["idle"]) / (tot - prev["tot"])) * 100, 1)
+                bot_cpu = round((ticks - prev["ticks"]) / clk / max(now - prev["t"], 0.001) / LOAD_STATE["ncpu"] * 100, 1)
+            prev = {"tot": tot, "idle": idle, "ticks": ticks, "t": now}
+            LOAD_STATE.update(supported=True, cpu=cpu, mem=mem_pct, mem_used_mb=used_mb, mem_total_mb=total_mb,
+                              bot_cpu=bot_cpu, bot_mem_mb=rss, load1=round(os.getloadavg()[0], 2),
+                              updated=get_ist_time())
+        except Exception:
+            LOAD_STATE["supported"] = False  # Linux नहीं है तो बस बंद
+            return
+        time.sleep(4)
+
+def load_level(cpu):
+    if cpu is None: return "unknown", "Measuring… please wait a few seconds"
+    if cpu < 30: return "free", "Free: the bot is free and runs smoothly"
+    if cpu < 60: return "light", "Light traffic: all good"
+    if cpu < 85: return "busy", "Busy: traffic is high right now"
+    return "heavy", "Heavy load: replies may be slow for a moment"
+
 def _ist_text(ts):
     if not ts: return ""
     return datetime.fromtimestamp(float(ts), BAN_TZ).strftime("%d %b %Y, %I:%M %p")
@@ -3407,6 +3467,14 @@ def api_live_stop():
             return jsonify({"error": "कुछ चल नहीं रहा"}), 400
         LIVE_JOB.update(stop=True, status="stopping")
     return jsonify({"status": "stopping"})
+
+@app.route("/dashboard/api/load")
+@require_auth
+def api_load():
+    snap = dict(LOAD_STATE)
+    lvl, msg = load_level(snap.get("cpu"))
+    snap["level"], snap["message"] = lvl, msg
+    return jsonify(snap)
 
 @app.route("/dashboard/api/purchases", methods=["DELETE"])
 @require_auth
@@ -3901,7 +3969,7 @@ function highlightNav(v){
 /* ============ screen templates ============ */
 const SHELL = {
   appupdate: () => `<div id="list"></div>`,
-  home: () => `<div class="note">Search any user from the top bar to see their full purchase history.</div><div id="list"></div>`,
+  home: () => `<div id="load-card"></div><div class="note">Search any user from the top bar to see their full purchase history.</div><div id="list"></div>`,
   orders: () => `<div class="seg">${[["all","All"],["pending","Pending"],["completed","Completed"],["expired","Expired"]]
       .map(([k, l]) => `<button data-of="${k}" class="${k === orderFilter ? "active" : ""}">${l}</button>`).join("")}</div><div class="toolbar" style="margin:12px 0"><button class="btn danger sm" data-act="clear-open">Clear open orders</button></div><div id="list"></div>`,
   users: () => `<div class="note">Recent users and their courses. Use the search bar to find a specific user.</div><div id="list"></div>`,
@@ -3986,6 +4054,45 @@ function purchasesHtml(uid, list){
       </div>${link}
       <button class="btn danger sm" data-act="rm-purchase" data-uid="${esc(uid)}" data-cid="${esc(p.course_id)}">${svg("trash")}Remove</button></div>`;
   }).join("");
+}
+
+let loadPolling = false;
+const LOAD_COLOR = p => p < 50 ? "#22c55e" : p < 80 ? "#eab308" : "#ef4444";
+function loadRow(label, pct, extra){
+  const p = pct == null ? 0 : Math.min(100, pct);
+  return `<div style="margin:12px 0">
+    <div style="display:flex;justify-content:space-between;font-size:13px;gap:8px"><span>${esc(label)}</span><span class="mono">${pct == null ? "…" : pct.toFixed(1) + "%"}${extra ? " · " + esc(extra) : ""}</span></div>
+    <div style="background:var(--surface-3);border-radius:8px;height:10px;overflow:hidden;margin-top:6px"><div style="width:${p}%;height:100%;background:${LOAD_COLOR(p)};transition:width .5s,background .5s"></div></div></div>`;
+}
+function renderLoad(d){
+  if(!d.supported) return `<div class="card"><h3>Bot load</h3><p class="sub-h">Live load shows only when the bot runs on a Linux server (AWS, Azure or Render).</p></div>`;
+  const colors = {free: "#22c55e", light: "#84cc16", busy: "#eab308", heavy: "#ef4444", unknown: "#94a3b8"};
+  const names = {free: "FREE", light: "LIGHT", busy: "BUSY", heavy: "HEAVY", unknown: "MEASURING"};
+  const botMemPct = d.bot_mem_mb != null && d.mem_total_mb ? d.bot_mem_mb * 100 / d.mem_total_mb : null;
+  return `<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+      <div><h3 style="margin:0">Bot load</h3><p class="sub-h" style="margin:4px 0 0">${esc(d.message)}</p></div>
+      <span class="pill" style="background:${colors[d.level] || "#94a3b8"};color:#000;font-weight:700">${names[d.level] || ""}</span></div>
+    <div style="margin-top:8px">
+      ${loadRow("Server CPU", d.cpu)}
+      ${loadRow("Server memory", d.mem, d.mem_used_mb != null ? d.mem_used_mb + " of " + d.mem_total_mb + " MB" : "")}
+      ${loadRow("Bot CPU", d.bot_cpu)}
+      ${loadRow("Bot memory", botMemPct, d.bot_mem_mb != null ? d.bot_mem_mb + " MB" : "")}
+    </div>
+    <p class="sub-h" style="margin-top:6px">Load (1 min): ${d.load1 != null ? d.load1 : "…"} · Updated ${esc(d.updated)} · refreshes every 5 seconds</p></div>`;
+}
+async function loadPoll(){
+  if(loadPolling) return;
+  loadPolling = true;
+  while(view === "home" && document.getElementById("load-card")){
+    try{
+      const d = await api("/dashboard/api/load");
+      const el = document.getElementById("load-card");
+      if(el) el.innerHTML = renderLoad(d);
+    }catch(e){ /* try again next round */ }
+    await new Promise(r => setTimeout(r, 5000));
+  }
+  loadPolling = false;
 }
 
 let feedPolling = false;
@@ -4090,6 +4197,8 @@ const RENDER = {
         <div class="toggle-row"><div class="lbl">Live feed on<small>Needs the channel ID below</small></div><input type="checkbox" id="live-on" ${live.enabled ? "checked" : ""}></div>
         <div class="form-grid" style="margin-top:12px">
           <div class="field"><label>Feed channel ID</label><input id="live-channel" placeholder="-1001234567890" value="${esc(live.channel_id)}"></div>
+          <div class="field"><label>Button text (under each post)</label><input id="live-share-text" value="${esc(live.share_text)}"></div>
+          <div class="field"><label>Button link (under each post)</label><input id="live-share-link" placeholder="https://t.me/+..." value="${esc(live.share_link)}"></div>
         </div>
         <div class="note" style="margin-top:12px"><b>Before turning this on:</b> add the bot as an <b>admin</b> of the feed channel, with permission to post messages. Use the channel ID (it starts with -100), not the invite link. When you save a new channel ID, all past purchases are sent to it automatically.</div>
         <div id="feed-job" style="margin-top:14px"></div>
@@ -4384,6 +4493,7 @@ function go(v, push = true){
   $("#page-sub").textContent = SUBS[v] || "";
   $("#body").innerHTML = SHELL[v]();
   loadView();
+  if(v === "home") loadPoll();
 }
 
 /* ============ actions ============ */
@@ -4490,7 +4600,8 @@ const ACTIONS = {
   "save-menu": async () => {
     const body = {
       footer: $("#menu-footer").value,
-      live: {enabled: $("#live-on").checked, channel_id: $("#live-channel").value.trim()},
+      live: {enabled: $("#live-on").checked, channel_id: $("#live-channel").value.trim(),
+             share_text: $("#live-share-text").value, share_link: $("#live-share-link").value.trim()},
     };
     const r = await api("/dashboard/api/menu-config", {method: "POST", body});
     toast(r && r.backfill === "started" ? "Saved. Past purchases are being sent to the feed." : "Saved");
@@ -5160,5 +5271,6 @@ if __name__ == "__main__":
     else:
         print("🛠 Setup mode: Dashboard में 'Add Bot / Setup' खोलें और settings भरें।", flush=True)
 
+    threading.Thread(target=load_sampler, daemon=True).start()
     # Dashboard हमेशा चलता है, ताकि settings वहीं से भरी जा सकें
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
