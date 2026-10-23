@@ -954,25 +954,21 @@ def feed_display_name(raw, uid):
     return f"Customer {n or ''}".strip()
 
 def post_live_feed(name, amount, channel_label, link=""):
-    """Format: बोल्ड नाम, PAYMENT DONE + amount, channel का नाम, और course link पर 'View channel'.
-    कोई username या chat tag नहीं."""
+    """सिर्फ़: ग्राहक का नाम, PAYMENT DONE, चैनल का नाम, और उस कोर्स का link. कोई बटन या 'View' नहीं."""
     cfg = get_live_cfg()
     if not cfg["enabled"] or not cfg["channel_id"]: return False
     text = (f"🔥 <b>Customer : {esc_html(name)}</b> 🔥\n\n"
             f"✅ <b>PAYMENT DONE · ₹{esc_html(amount)}</b>\n\n"
             f"📺 Channel: <b>{esc_html(channel_label)}</b> - Added")
     if str(link).startswith("http"):
-        text += f"\n\n👁️ <a href=\"{esc_html(link)}\">View channel</a>"
-    markup = None
-    if cfg["share_link"].startswith("http"):
-        markup = InlineKeyboardMarkup().row(kbtn(cfg["share_text"], url=cfg["share_link"]))
+        text += f"\n\n{esc_html(link)}"
     try:
-        orig_send_message(int(cfg["channel_id"]), text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+        orig_send_message(int(cfg["channel_id"]), text, parse_mode="HTML", disable_web_page_preview=True)
         return True
     except Exception as e:
         print(f"⚠️ live feed post failed, plain fallback: {e}", flush=True)
         try:
-            orig_send_message(int(cfg["channel_id"]), re.sub(r"<[^>]*>", "", text), reply_markup=markup, disable_web_page_preview=True)
+            orig_send_message(int(cfg["channel_id"]), re.sub(r"<[^>]*>", "", text), disable_web_page_preview=True)
             return True
         except Exception as e2:
             print(f"⚠️ live feed post failed: {e2}", flush=True)
@@ -4094,8 +4090,6 @@ const RENDER = {
         <div class="toggle-row"><div class="lbl">Live feed on<small>Needs the channel ID below</small></div><input type="checkbox" id="live-on" ${live.enabled ? "checked" : ""}></div>
         <div class="form-grid" style="margin-top:12px">
           <div class="field"><label>Feed channel ID</label><input id="live-channel" placeholder="-1001234567890" value="${esc(live.channel_id)}"></div>
-          <div class="field"><label>Share button text</label><input id="live-share-text" value="${esc(live.share_text)}"></div>
-          <div class="field"><label>Share button link</label><input id="live-share-link" placeholder="https://t.me/+..." value="${esc(live.share_link)}"></div>
         </div>
         <div class="note" style="margin-top:12px"><b>Before turning this on:</b> add the bot as an <b>admin</b> of the feed channel, with permission to post messages. Use the channel ID (it starts with -100), not the invite link. When you save a new channel ID, all past purchases are sent to it automatically.</div>
         <div id="feed-job" style="margin-top:14px"></div>
@@ -4496,8 +4490,7 @@ const ACTIONS = {
   "save-menu": async () => {
     const body = {
       footer: $("#menu-footer").value,
-      live: {enabled: $("#live-on").checked, channel_id: $("#live-channel").value.trim(),
-             share_text: $("#live-share-text").value, share_link: $("#live-share-link").value.trim()},
+      live: {enabled: $("#live-on").checked, channel_id: $("#live-channel").value.trim()},
     };
     const r = await api("/dashboard/api/menu-config", {method: "POST", body});
     toast(r && r.backfill === "started" ? "Saved. Past purchases are being sent to the feed." : "Saved");
