@@ -864,53 +864,56 @@ def handle_menu_action(user_id, btn, first_name):
     elif act == "message" and btn.get("value"):
         orig_send_message(user_id, btn["value"], parse_mode="HTML")
 
+def get_footer_text():
+    saved = get_cached_setting("menu_cfg") or {}
+    return saved["footer"] if "footer" in saved else "🔥 More packs coming soon, stay tuned!"
+
 def send_my_orders(user_id, first_name):
-    lines = [f"👤 <b>{esc_html(first_name or 'User')}</b>", f"🆔 <code>{user_id}</code>", ""]
     purchases = list(purchases_col.find({"user_id": user_id}).sort("_id", 1))
-    lines.append(f"🛍 <b>Your purchases: {len(purchases)}</b>")
-    if not purchases: lines.append("• No purchases yet.")
-    course_ids = []
-    for i, p in enumerate(purchases[:15], 1):
-        cid = str(p.get("item_info", "")).split(" | ")[0]
-        if cid and cid not in course_ids: course_ids.append(cid)
-        lines.append(f"{i}. <b>{esc_html(p.get('title') or cid)}</b>\n    🆔 <code>{esc_html(cid)}</code> · 📅 {esc_html(p.get('date', ''))}")
+    info_cache, join_cache = {}, {}
 
-    pend = list(orders_col.find({"user_id": user_id, "status": {"$in": ["PENDING", "EXPIRED", "CANCELLED"]}}).sort("created_at", -1).limit(8))
-    if pend:
-        labels = {"PENDING": "⏳ Payment not verified yet", "EXPIRED": "⚠️ QR expired, not paid", "CANCELLED": "❌ Cancelled"}
-        lines += ["", "⏳ <b>Pending / problems</b>"]
-        for o in pend:
-            lines.append(f"• ₹{esc_html(o.get('amount'))} · <code>{esc_html(o.get('course_id'))}</code> · {esc_html(o.get('created_at_str', ''))}\n    {labels.get(o.get('status'), '')}")
+    def label(cid):
+        if cid not in info_cache:
+            c = courses_col.find_one({"course_id": cid}, {"channel_name": 1, "title": 1}) or {}
+            info_cache[cid] = c.get("channel_name") or c.get("title") or cid
+        return info_cache[cid]
 
-    if course_ids:
-        lines += ["", "🚪 <b>Channel history</b>"]
-        for cid in course_ids[:10]:
-            course = courses_col.find_one({"course_id": cid}, {"channel_name": 1, "title": 1, "channel_id": 1, "channel_ids": 1}) or {}
-            if not (course.get("channel_id") or course.get("channel_ids")): continue
-            label = course.get("channel_name") or course.get("title") or cid
-            evs = list(member_events_col.find({"user_id": user_id, "course_id": cid}).sort("ts", 1))
-            joined = next((e for e in evs if e.get("event") == "joined"), None)
-            left = next((e for e in reversed(evs) if e.get("event") == "left"), None)
-            if joined is None:
-                appr = channel_logs_col.find_one({"user_id": user_id, "course_id": cid, "status": "APPROVED"}, sort=[("_id", 1)])
-                if appr: joined = {"date": appr.get("date", ""), "ts": None}
-            lines.append(f"• <b>{esc_html(label)}</b>")
-            if joined is None:
-                lines.append("    ⏳ Not joined yet")
-                continue
-            lines.append(f"    ✅ Joined: {esc_html(joined.get('date', ''))}")
-            if left and (joined.get("ts") is None or left.get("ts", 0) >= joined["ts"]):
-                dur = ""
-                if joined.get("ts") and left.get("ts"):
-                    mins = int((left["ts"] - joined["ts"]) // 60)
-                    dur = f" (stayed {mins // 1440}d {(mins % 1440) // 60}h {mins % 60}m)"
-                lines.append(f"    🚪 Left: {esc_html(left.get('date', ''))}{dur}")
+    def joined(cid):
+        if cid not in join_cache:
+            ev = member_events_col.find_one({"user_id": user_id, "course_id": cid, "event": "joined"}, sort=[("ts", 1)])
+            if ev: join_cache[cid] = ev.get("date", "")
             else:
-                lines.append("    🟢 Still in channel")
+                ap = channel_logs_col.find_one({"user_id": user_id, "course_id": cid, "status": "APPROVED"}, sort=[("_id", 1)])
+                join_cache[cid] = ap.get("date", "") if ap else ""
+        return join_cache[cid]
+
+    lines = ["📋 <b>MY ORDER LIST</b>", "━━━━━━━━━━━━━━", "",
+             f"👤 <b>{esc_html(first_name or 'User')}</b>",
+             f"🛍 Total purchases: <b>{len(purchases)}</b>", ""]
+    if not purchases:
+        lines.append("You have no purchases yet.")
+    for i, p in enumerate(purchases[:20], 1):
+        cid = str(p.get("item_info", "")).split(" | ")[0]
+        jd = joined(cid)
+        lines.append(f"<b>{i}. {esc_html(label(cid))}</b>\n    📅 Joined: {esc_html(jd) if jd else 'Not joined yet'}")
+
+    activity = []
+    for p in purchases[-10:]:
+        cid = str(p.get("item_info", "")).split(" | ")[0]
+        activity.append(f"🛒 {esc_html(label(cid))} · purchased {esc_html(p.get('date', ''))}")
+    for e in member_events_col.find({"user_id": user_id, "event": "left"}).sort("ts", -1).limit(10):
+        activity.append(f"🚪 {esc_html(label(e.get('course_id', '')))} · left {esc_html(e.get('date', ''))}")
+    if activity:
+        lines += ["", "━━━━━━━━━━━━━━", "🕘 <b>Activity</b>"] + [f"• {a}" for a in activity]
+
+    footer = get_footer_text()
+    if footer: lines += ["", footer]
 
     text = "\n".join(lines)
     if len(text) > 3900: text = text[:3900] + "…"
-    try: orig_send_message(user_id, text, parse_mode="HTML", disable_web_page_preview=True)
+    link = CHAT_LINK if str(CHAT_LINK).startswith(("http", "tg://")) else f"tg://user?id={ADMIN_ID}"
+    markup = InlineKeyboardMarkup().row(kbtn("💬 Contact Admin", url=link))
+    try: orig_send_message(user_id, text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
     except Exception: pass
 
 def get_live_cfg():
@@ -3198,14 +3201,43 @@ def _parse_menu_lines(txt):
     if len(out) > 12: raise ValueError("Maximum 12 buttons")
     return out
 
+def _validate_menu_buttons(items):
+    if len(items) > 12: raise ValueError("Maximum 12 buttons")
+    out = []
+    for b in items:
+        text = str(b.get("text", "")).strip()[:64]
+        act = str(b.get("action", "")).strip()
+        val = str(b.get("value", "")).strip()
+        if not text: raise ValueError("बटन का नाम खाली नहीं हो सकता")
+        if act == "my_orders":
+            out.append({"text": text, "action": "my_orders", "value": ""})
+        elif act == "link":
+            if not val.startswith("http"): raise ValueError(f"'{text}': link https:// से शुरू होना चाहिए")
+            out.append({"text": text, "action": "link", "value": val})
+        elif act == "message":
+            if not val: raise ValueError(f"'{text}': message खाली नहीं हो सकता")
+            out.append({"text": text, "action": "message", "value": val[:2000]})
+        else:
+            raise ValueError(f"'{text}': action गलत है")
+    return out
+
 @app.route("/dashboard/api/menu-config", methods=["GET", "POST"])
 @require_auth
 def api_menu_config():
-    if request.method == "POST":
-        d = request.json or {}
-        try: buttons = _parse_menu_lines(d.get("menu_text", ""))
-        except ValueError as e: return jsonify({"error": str(e)}), 400
-        lv = d.get("live") or {}
+    if request.method == "GET":
+        return jsonify({"buttons": get_menu_cfg(), "footer": get_footer_text(), "live": get_live_cfg()})
+    d = request.json or {}
+    try:
+        if isinstance(d.get("buttons"), list): buttons = _validate_menu_buttons(d["buttons"])
+        elif "menu_text" in d: buttons = _parse_menu_lines(d.get("menu_text", ""))
+        else: buttons = None
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    live_set = None
+    old_live = get_live_cfg()
+    if isinstance(d.get("live"), dict):
+        lv = d["live"]
         enabled = bool(lv.get("enabled"))
         ch = str(lv.get("channel_id", "")).strip()
         if enabled and not re.fullmatch(r"-?\d{6,}", ch):
@@ -3213,24 +3245,24 @@ def api_menu_config():
         link = str(lv.get("share_link", "")).strip()
         if link and not link.startswith("http"):
             return jsonify({"error": "Share link https:// से शुरू होना चाहिए"}), 400
-        old_live = get_live_cfg()
-        settings_col.update_one({"_id": "menu_cfg"}, {"$set": {"buttons": buttons, "updated_at": get_ist_time()}}, upsert=True)
-        settings_col.update_one({"_id": "live_feed_cfg"}, {"$set": {
-            "enabled": enabled, "channel_id": ch, "share_text": str(lv.get("share_text", "")).strip()[:64] or "🔗 Join & Buy",
-            "share_link": link, "updated_at": get_ist_time()}}, upsert=True)
-        invalidate_cache("menu_cfg"); invalidate_cache("live_feed_cfg")
-        if enabled and ch and ch != old_live["channel_id"]:
-            # नया feed channel: पुरानी सारी purchases उसमें अपने-आप जाएँगी
+        live_set = {"enabled": enabled, "channel_id": ch,
+                    "share_text": str(lv.get("share_text", "")).strip()[:64] or "🔗 Join & Buy",
+                    "share_link": link, "updated_at": get_ist_time()}
+
+    menu_set = {"updated_at": get_ist_time()}
+    if buttons is not None: menu_set["buttons"] = buttons
+    if "footer" in d: menu_set["footer"] = str(d.get("footer") or "")[:300]
+    settings_col.update_one({"_id": "menu_cfg"}, {"$set": menu_set}, upsert=True)
+    invalidate_cache("menu_cfg")
+
+    if live_set is not None:
+        settings_col.update_one({"_id": "live_feed_cfg"}, {"$set": live_set}, upsert=True)
+        invalidate_cache("live_feed_cfg")
+        if live_set["enabled"] and live_set["channel_id"] and live_set["channel_id"] != old_live["channel_id"]:
             purchases_col.update_many({}, {"$unset": {"feed_posted": ""}})
             threading.Thread(target=backfill_live_feed, daemon=True).start()
             return jsonify({"status": "success", "backfill": "started"})
-        return jsonify({"status": "success"})
-    lines = []
-    for b in get_menu_cfg():
-        act = {"my_orders": "orders", "link": "link", "message": "message"}.get(b.get("action"), "message")
-        lines.append(f"{b['text']} | {act} | {b.get('value', '')}".rstrip(" |"))
-    lv = get_live_cfg()
-    return jsonify({"menu_text": "\n".join(lines), "live": lv})
+    return jsonify({"status": "success"})
 
 @app.route("/dashboard/api/live-feed/backfill", methods=["POST"])
 @require_auth
@@ -3880,12 +3912,20 @@ const RENDER = {
 
   menu: c => {
     const live = c.live || {};
+    const btns = c.buttons || [];
+    const actLabel = {my_orders: "Shows My Order List", link: "Opens a link", message: "Sends a message"};
+    const rows = btns.length ? btns.map((b, i) => `<div class="row">
+        <div class="grow"><div class="title">${esc(b.text)}</div>
+          <div class="meta">${esc(actLabel[b.action] || b.action)}${b.value ? " · " + esc(b.value) : ""}</div></div>
+        <div class="right"><div class="end"><button class="btn danger sm" data-act="menu-del" data-idx="${i}">${svg("trash")}Delete</button></div></div></div>`).join("") : empty("No buttons yet. Tap + Add button.");
     $("#list").innerHTML = `
-      <div class="card"><h3>Bottom menu buttons</h3>
-        <p class="sub-h">These buttons appear at the bottom of the bot chat. One per line: <code>Button text | action | value</code></p>
-        <p class="sub-h"><b>orders</b> shows the My Orders screen (no value needed) · <b>link</b> opens a web link (value = https://...) · <b>message</b> sends your text (value = the message).</p>
-        <textarea id="menu-lines" style="min-height:150px" placeholder="📦 My Orders | orders&#10;🔴 Live Purchases | link | https://t.me/+xxxx&#10;💬 Help | message | Contact admin: @yourname">${esc(c.menu_text)}</textarea>
-        <p class="sub-h" style="margin-top:8px">Changes apply after the customer sends /start again.</p></div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+          <div><h3>Bottom menu buttons</h3><p class="sub-h" style="margin:0">These appear at the bottom of the bot chat. Customers see them after /start.</p></div>
+          <button class="btn primary" data-act="menu-add">+ Add button</button></div>
+        <div style="margin-top:12px">${rows}</div></div>
+      <div class="card"><h3>My Order List teaser</h3><p class="sub-h">One line shown at the bottom of My Order List. Leave it empty to hide it.</p>
+        <div class="field"><input id="menu-footer" value="${esc(c.footer)}"></div></div>
       <div class="card"><h3>Live purchase feed</h3>
         <p class="sub-h">Posts every new paid purchase to a public channel. It shows only the buyer's name, amount, channel name and date. There is no link to the buyer, so nobody can open a chat with them from the feed.</p>
         <div class="toggle-row"><div class="lbl">Live feed on<small>Needs the channel ID below</small></div><input type="checkbox" id="live-on" ${live.enabled ? "checked" : ""}></div>
@@ -3894,10 +3934,10 @@ const RENDER = {
           <div class="field"><label>Share button text</label><input id="live-share-text" value="${esc(live.share_text)}"></div>
           <div class="field"><label>Share button link</label><input id="live-share-link" placeholder="https://t.me/+..." value="${esc(live.share_link)}"></div>
         </div>
-        <div class="note" style="margin-top:12px"><b>Before turning this on:</b> add the bot as an <b>admin</b> of the feed channel, with permission to post messages. Use the channel ID (it starts with -100), not the invite link.</div>
+        <div class="note" style="margin-top:12px"><b>Before turning this on:</b> add the bot as an <b>admin</b> of the feed channel, with permission to post messages. Use the channel ID (it starts with -100), not the invite link. When you save a new channel ID, all past purchases are sent to it automatically.</div>
         <div style="display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:12px">
-          <button class="btn ghost" data-act="backfill-feed">${live.backfilled_at ? "Share old purchases again" : "Share old purchases to feed"}</button>
-          <button class="btn primary" data-act="save-menu">Save menu & feed</button></div>
+          <button class="btn ghost" data-act="backfill-feed">Send past purchases again</button>
+          <button class="btn primary" data-act="save-menu">Save feed & teaser</button></div>
       </div>`;
   },
 
@@ -4266,14 +4306,46 @@ const ACTIONS = {
     await api("/dashboard/api/success-msg", {method: "POST", body: {reset: true}});
     toast("Reset done"); delete cache.delivery; loadView(true);
   },
+  "menu-add": () => openModal("Add a bottom button", `
+      <div class="field"><label>Button name (what customers see)</label><input id="mb-name" placeholder="📋 My Order List"></div>
+      <div class="field"><label>Action (what happens on tap)</label>
+        <select id="mb-action">
+          <option value="my_orders">Show My Order List</option>
+          <option value="link">Open a link</option>
+          <option value="message">Send a message</option>
+        </select></div>
+      <div class="field"><label>Value (only for link or message)</label><input id="mb-value" placeholder="https://t.me/+xxxx  or  your message text"></div>
+      <div class="note" style="margin-top:10px"><b>How it works:</b><br>
+        • <b>Show My Order List:</b> leave value empty. The customer sees their purchases.<br>
+        • <b>Open a link:</b> value = a full link starting with https://. It opens when tapped.<br>
+        • <b>Send a message:</b> value = the text the bot replies with (HTML bold tags work).</div>`,
+      {foot: `<button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn primary" data-act="menu-save-new">Add button</button>`}),
+  "menu-save-new": async () => {
+    const name = $("#mb-name").value.trim(), action = $("#mb-action").value, value = $("#mb-value").value.trim();
+    if(!name) return toast("Enter a button name", "err");
+    if(action === "link" && !value.startsWith("http")) return toast("Link must start with https://", "err");
+    if(action === "message" && !value) return toast("Enter the message text", "err");
+    const list = ((cache.menu && cache.menu.buttons) || []).concat([{text: name, action, value: action === "my_orders" ? "" : value}]);
+    await api("/dashboard/api/menu-config", {method: "POST", body: {buttons: list}});
+    closeModal(); toast("Button added"); delete cache.menu; loadView(true);
+  },
+  "menu-del": async el => {
+    const ok = await confirmBox({title: "Delete this button?", text: "Customers will no longer see it in the bot menu.", okText: "Delete"});
+    if(!ok) return;
+    fadeRow(el);
+    const list = ((cache.menu && cache.menu.buttons) || []).filter((_, i) => i !== +el.dataset.idx);
+    await api("/dashboard/api/menu-config", {method: "POST", body: {buttons: list}});
+    toast("Button deleted"); delete cache.menu; loadView(true);
+  },
   "save-menu": async () => {
     const body = {
-      menu_text: $("#menu-lines").value,
+      footer: $("#menu-footer").value,
       live: {enabled: $("#live-on").checked, channel_id: $("#live-channel").value.trim(),
              share_text: $("#live-share-text").value, share_link: $("#live-share-link").value.trim()},
     };
-    await api("/dashboard/api/menu-config", {method: "POST", body});
-    toast("Menu and feed saved"); delete cache.menu; loadView(true);
+    const r = await api("/dashboard/api/menu-config", {method: "POST", body});
+    toast(r && r.backfill ? "Saved. Past purchases are being sent to the feed." : "Saved");
+    delete cache.menu; loadView(true);
   },
   "backfill-feed": async () => {
     const ok = await confirmBox({title: "Share old purchases to the feed?", text: "Every purchase that has not been posted yet will be sent to the feed channel, one by one. This can take a few minutes.", okText: "Start", danger: false});
