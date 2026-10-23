@@ -158,6 +158,32 @@ ORDER_TTL_HOURS = int(_to_num(CFG["ORDER_TTL_HOURS"], 48))
 BOT_CONFIGURED = bool(MONGO_URI and DASHBOARD_PASSWORD and BOT_TOKEN and ADMIN_ID and DB_CHANNEL_ID and UPI_ID and SMS_HOOK_SECRET)
 
 bot = telebot.TeleBot(BOT_TOKEN or "1:SETUP", num_threads=20)
+
+# 🎨 BUTTON COLOUR (Telegram: green = success, red = danger, blue = primary; खाली = default grey)
+BTN_STYLES = {"": None, "default": None, "green": "success", "success": "success",
+              "red": "danger", "danger": "danger", "blue": "primary", "primary": "primary"}
+
+class StyledButton(telebot.types.InlineKeyboardButton):
+    def __init__(self, text, style=None, **kwargs):
+        super().__init__(text, **kwargs)
+        self.style = BTN_STYLES.get(str(style or "").strip().lower())
+    def to_dict(self):
+        d = super().to_dict()
+        if self.style: d["style"] = self.style
+        return d
+
+def kbtn(text, url=None, callback_data=None, style=None):
+    return StyledButton(text, style=style, url=url, callback_data=callback_data)
+
+def parse_btn_line(txt):
+    """'Text - URL' या 'Text - URL - red/green/blue' → (text, url, style)"""
+    parts = [p.strip() for p in str(txt).split(" - ")]
+    style = ""
+    if len(parts) >= 3 and parts[-1].lower() in BTN_STYLES:
+        style = parts[-1].lower(); parts = parts[:-1]
+    if len(parts) < 2 or not parts[0] or not parts[-1]:
+        raise ValueError("format")
+    return " - ".join(parts[:-1]), parts[-1], style
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def get_ist_time():
@@ -218,6 +244,8 @@ try:
     channel_logs_col = db["channel_logs"]
     admins_col = db["admins"]  # Dashboard से जोड़े गए extra admins
     broadcasts_col = db["broadcasts"]  # Dashboard से भेजे गए broadcasts का रिकॉर्ड (हटाने के लिए)
+    banned_col = db["banned_users"]  # Ban list (Dashboard + bot panel)
+    join_prompts_col = db["join_prompts"]  # "Send request" message का रिकॉर्ड, request आने पर उसे हटाने के लिए
 
     try:
         sms_pool_col.create_index("created_at_dt", expireAfterSeconds=SMS_POOL_TTL_HOURS * 3600)
@@ -553,6 +581,11 @@ alloc_lock = threading.Lock()
 reserved_now = {}  # amount -> समय; order बनने की प्रक्रिया में चल रहे amounts (race से बचाव)
 ALLOC_RESERVE_SECONDS = 900
 
+def first_exact_enabled():
+    """ON हो तो पहला order ठीक base amount (जैसे 100.00) पर बनता है, बाद वाले 100.01, 100.02 ..."""
+    cfg = get_cached_setting("system_settings") or {}
+    return bool(cfg.get("first_exact_amount", False))
+
 def get_order_hold_seconds():
     """Expired/pending order का amount कितने समय तक late SMS के लिए बुक रहेगा.
     Dashboard > Settings > 'Order amount hold' से बदला जाता है. Default 12 घंटे."""
@@ -561,9 +594,9 @@ def get_order_hold_seconds():
     except (TypeError, ValueError): hrs = 12.0
     return max(1.0, hrs) * 3600
 
-def _taken_amounts(base_clean):
+def _taken_amounts(base_clean, include_exact=False):
     """उस base (जैसे 50) के 50.01 से 50.99 तक में कौन से amounts बुक हैं"""
-    cands = [f"{base_clean + p / 100:.2f}" for p in range(1, 100)]
+    cands = ([f"{base_clean:.2f}"] if include_exact else []) + [f"{base_clean + p / 100:.2f}" for p in range(1, 100)]
     taken = set()
     now = time.time()
     with pending_lock:
@@ -584,7 +617,7 @@ def generate_unique_amount(base_amount):
     """सबसे छोटा खाली paise वाला amount देता है (जैसे 50.10). पेमेंट approve/cancel होते ही वो amount फिर से खाली हो जाता है.
     सारे 99 बुक हों तो None लौटता है."""
     base_clean = int(float(base_amount))
-    cands, taken = _taken_amounts(base_clean)
+    cands, taken = _taken_amounts(base_clean, include_exact=first_exact_enabled())
     for c in cands:
         if c not in taken:
             reserved_now[c] = time.time()
@@ -594,6 +627,86 @@ def generate_unique_amount(base_amount):
 # ==========================================
 # 🎟 DYNAMIC PRICE & OFFER VALIDATION
 # ==========================================
+# ==========================================
+# 🚫 BAN LIST (Dashboard + bot panel)
+# ==========================================
+BAN_CACHE = {"ts": 0.0, "ids": {}, "names": {}}
+BAN_TZ = timezone(timedelta(hours=5, minutes=30))
+
+def _norm_uname(u):
+    return str(u or "").strip().lstrip("@").lower()
+
+def parse_ban_target(raw):
+    """'123456' → ('id', 123456); '@name' या 'name' → ('name', 'name'); गलत हो तो (None, None)"""
+    t = str(raw or "").strip()
+    if t.isdigit(): return "id", int(t)
+    n = _norm_uname(t)
+    if re.fullmatch(r"[A-Za-z0-9_]{3,64}", n): return "name", n
+    return None, None
+
+def _resolve_user(kind, val):
+    if kind == "id":
+        u = users_col.find_one({"user_id": val}, {"username": 1}) or {}
+        return val, _norm_uname(u.get("username"))
+    u = users_col.find_one({"username": {"$regex": "^" + re.escape(val) + "$", "$options": "i"}}, {"user_id": 1}) or {}
+    return u.get("user_id"), val
+
+def _ban_match(uid, uname):
+    conds = []
+    if uid is not None: conds.append({"user_id": uid})
+    if uname: conds.append({"username": uname})
+    return {"$or": conds} if conds else {"_id": None}
+
+def _ban_index(force=False):
+    now = time.time()
+    if not force and now - BAN_CACHE["ts"] < 20: return BAN_CACHE
+    ids, names = {}, {}
+    try:
+        for b in banned_col.find({}):
+            until = None if b.get("permanent") else b.get("until")
+            if until is not None and until <= now: continue
+            if b.get("user_id") is not None: ids[int(b["user_id"])] = until
+            if b.get("username"): names[_norm_uname(b["username"])] = until
+        BAN_CACHE.update({"ts": now, "ids": ids, "names": names})
+    except Exception:
+        pass  # DB अभी नहीं है: पुराना cache ही चलेगा
+    return BAN_CACHE
+
+def is_banned(user_id=None, username=None):
+    if user_id is not None and is_admin(user_id): return False
+    idx = _ban_index()
+    now = time.time()
+    checks = ((idx["ids"], user_id), (idx["names"], _norm_uname(username) if username else None))
+    for store, key in checks:
+        if key is None or key == "" or key not in store: continue
+        until = store[key]
+        if until is None or until > now: return True
+    return False
+
+def set_ban(target_raw, hours=None, reason=""):
+    """hours=None मतलब permanent; वरना इतने घंटे तक ban"""
+    kind, val = parse_ban_target(target_raw)
+    if not kind: raise ValueError("User ID (सिर्फ़ numbers) या @username डालें")
+    uid, uname = _resolve_user(kind, val)
+    if uid is None and not uname: raise ValueError("यूज़र नहीं मिला")
+    banned_col.delete_many(_ban_match(uid, uname))
+    now = time.time()
+    banned_col.insert_one({
+        "user_id": uid, "username": uname, "permanent": hours is None,
+        "until": None if hours is None else now + float(hours) * 3600,
+        "banned_at": get_ist_time(), "banned_at_ts": now, "reason": (reason or "")[:200],
+    })
+    BAN_CACHE["ts"] = 0.0
+    return {"user_id": uid, "username": uname}
+
+def unban_user(target_raw):
+    kind, val = parse_ban_target(target_raw)
+    if not kind: raise ValueError("User ID (सिर्फ़ numbers) या @username डालें")
+    uid, uname = _resolve_user(kind, val)
+    n = banned_col.delete_many(_ban_match(uid, uname)).deleted_count
+    BAN_CACHE["ts"] = 0.0
+    return n
+
 def get_offer_usage_count(user_id, offer_code):
     return orders_col.count_documents({"user_id": user_id, "offer_id": offer_code, "status": {"$in": ["COMPLETED_AUTO", "COMPLETED_MANUAL"]}})
 
@@ -713,6 +826,64 @@ def expire_qr(chat_id, message_id, course_id, amount_key, order_id):
     try: bot.send_message(chat_id, "⏳ <b>QR Code has expired!</b>\n\nIf you have already paid, click <b>'✅ Verify Payment'</b> below.", reply_markup=markup, parse_mode="HTML", msg_type="general")
     except Exception: pass
 
+SUCC_DEFAULTS = {
+    "header": "🎉 <b>Payment Successful!</b>",
+    "between": "",
+    "body": "👉 <b>Please send a request</b> to the channel using the button below.",
+    "main_btn": {"text": "📢 Send Request", "style": "success", "enabled": True},
+    "buttons": [],
+    "received_text": "✅ <b>You have been added to this channel.</b>\nTap the button below to open the channel.",
+    "received_btn": {"text": "📺 Open Channel", "style": "primary", "enabled": True},
+}
+
+def get_success_cfg():
+    """Post-purchase message की settings (Dashboard > Post-purchase message, या bot panel से).
+    जो field सेट नहीं है उसका default रहता है."""
+    saved = get_cached_setting("success_msg_cfg") or {}
+    cfg = json.loads(json.dumps(SUCC_DEFAULTS))
+    for k in ("header", "body", "received_text"):
+        if k in saved and saved[k] is not None: cfg[k] = saved[k]
+    cfg["between"] = saved["between"] if "between" in saved else saved.get("text", "")
+    for k in ("main_btn", "received_btn"):
+        if isinstance(saved.get(k), dict): cfg[k].update(saved[k])
+    if isinstance(saved.get("buttons"), list): cfg["buttons"] = saved["buttons"]
+    return cfg
+
+def add_custom_buttons(markup, btns):
+    for b in btns or []:
+        b_url = str(b.get("url", "")).strip()
+        b_text = str(b.get("text", "")).strip() or "Button"
+        style = b.get("style")
+        if b_url.lower() == "close": markup.row(kbtn(b_text, callback_data="close_msg", style=style))
+        elif b_url.startswith("http"): markup.row(kbtn(b_text, url=b_url, style=style))
+        elif b_url: markup.row(kbtn(b_text, callback_data=b_url, style=style))
+
+def extract_invite_link(secret_text):
+    m = re.search(r"https?://[^\s<>\"']+", str(secret_text or ""))
+    return m.group(0) if m else ""
+
+def send_html_safe(chat_id, text, markup=None, protect=False):
+    """HTML भेजने की कोशिश; अगर HTML गलत हो तो बिना tags के plain text भेजो (customer को कुछ न कुछ ज़रूर मिले)"""
+    try:
+        return bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML", protect_content=protect, msg_type="purchase")
+    except Exception as e:
+        print(f"⚠️ HTML send failed, plain fallback: {e}", flush=True)
+        plain = re.sub(r"<[^>]*>", "", text)
+        return bot.send_message(chat_id, plain, reply_markup=markup, protect_content=protect, msg_type="purchase")
+
+def send_request_received(user_id, link):
+    """Join request उठने के बाद: 'request received' मैसेज + channel का बटन"""
+    scfg = get_success_cfg()
+    rb = scfg["received_btn"]
+    markup = InlineKeyboardMarkup()
+    if rb.get("enabled", True) and link:
+        markup.row(kbtn(rb.get("text") or "📺 Open Channel", url=link, style=rb.get("style")))
+    try:
+        orig_send_message(user_id, scfg["received_text"], reply_markup=markup if markup.keyboard else None, parse_mode="HTML")
+    except Exception:
+        try: orig_send_message(user_id, re.sub(r"<[^>]*>", "", scfg["received_text"]), reply_markup=markup if markup.keyboard else None)
+        except Exception: pass
+
 def deliver_course_to_buyer(order, sms_text=None, is_manual=False):
     order_id, chat_id, user_id, course_id = order["order_id"], order["chat_id"], order["user_id"], order["course_id"]
     course = get_cached_course(course_id) or {}
@@ -738,23 +909,29 @@ def deliver_course_to_buyer(order, sms_text=None, is_manual=False):
         except Exception: pass
         return
 
-    succ_cfg = get_cached_setting("success_msg_cfg") or {}
-    extra_txt = succ_cfg.get("text", "").strip()
-    succ_btns = succ_cfg.get("buttons", [])
-
-    final_text = f"🎉 <b>Payment Verified Successfully!</b>\n\n{course.get('secret_text','')}"
-    if extra_txt: final_text += f"\n\n{extra_txt}"
-
+    scfg = get_success_cfg()
+    is_channel = bool(course.get("channel_id") or course.get("channel_ids"))
     markup = InlineKeyboardMarkup()
-    for b in succ_btns:
-        b_url = b.get("url", "")
-        if b_url.lower() == "close": markup.row(InlineKeyboardButton(b["text"], callback_data="close_msg"))
-        elif b_url.startswith("http"): markup.row(InlineKeyboardButton(b["text"], url=b_url))
-        else: markup.row(InlineKeyboardButton(b["text"], callback_data=b_url))
-    
+    join_link = extract_invite_link(course.get("secret_text", "")) if is_channel else ""
+    if is_channel:
+        # Channel pack: secret link text में नहीं दिखता, सिर्फ़ बटन में जाता है
+        final_text = scfg["header"]
+        if scfg["between"]: final_text += f"\n\n{scfg['between']}"
+        if scfg["body"]: final_text += f"\n\n{scfg['body']}"
+        mb = scfg["main_btn"]
+        if mb.get("enabled", True) and join_link:
+            markup.row(kbtn(mb.get("text") or "📢 Send Request", url=join_link, style=mb.get("style")))
+    else:
+        final_text = f"{scfg['header']}\n\n{course.get('secret_text','')}"
+        if scfg["between"]: final_text += f"\n\n{scfg['between']}"
+    add_custom_buttons(markup, scfg["buttons"])
     if not markup.keyboard: markup = None
 
-    try: bot.send_message(chat_id, final_text, reply_markup=markup, parse_mode="HTML", protect_content=is_protected(), msg_type="purchase")
+    try:
+        sent = send_html_safe(chat_id, final_text, markup, protect=is_protected())
+        if is_channel and join_link and scfg["main_btn"].get("enabled", True) and sent is not None:
+            join_prompts_col.update_one({"user_id": user_id, "course_id": course_id},
+                {"$set": {"chat_id": chat_id, "msg_id": sent.message_id, "invite_link": join_link, "created_at": get_ist_time()}}, upsert=True)
     except Exception: pass
 
     date_now = get_ist_time()
@@ -797,6 +974,11 @@ def handle_join_request(message):
             
     if not course: return
         
+    if is_banned(user_id, getattr(message.from_user, "username", None)):
+        try: bot.decline_chat_join_request(chat_id, user_id)
+        except Exception: pass
+        return
+
     course_id = course["course_id"]
     channel_name = course.get("channel_name") or message.chat.title or "Private Channel/Group"
     purchase = purchases_col.find_one({"user_id": user_id, "item_info": {"$regex": re.escape(course_id)}})
@@ -807,12 +989,16 @@ def handle_join_request(message):
     u_men = f"<a href='tg://user?id={user_id}'>{u_first_name}</a>"
 
     if purchase:
-        try: 
+        try:
             bot.approve_chat_join_request(chat_id, user_id)
             def _bg_log_ap():
                 channel_logs_col.insert_one({"user_id": user_id, "first_name": u_first_name, "username": u_username, "course_id": course_id, "channel_name": channel_name, "status": "APPROVED", "date": now_str})
             threading.Thread(target=_bg_log_ap, daemon=True).start()
-            orig_send_message(user_id, f"✅ <b>Request Approved!</b>\nWelcome to <b>{channel_name}</b>.", parse_mode="HTML")
+            prompt = join_prompts_col.find_one_and_delete({"user_id": user_id, "course_id": course_id})
+            if prompt:
+                try: bot.delete_message(prompt.get("chat_id", user_id), prompt.get("msg_id"))
+                except Exception: pass
+            send_request_received(user_id, (prompt or {}).get("invite_link") or used_link or extract_invite_link(course.get("secret_text", "")))
         except Exception: pass
     else:
         try:
@@ -973,6 +1159,7 @@ ADMIN_CATEGORIES = {
     "broadcast": ("📢 Broadcast & Users", [
         ("📢 Advanced Broadcast", "admin_broadcast"),
         ("👥 User Info", "admin_user_info"),
+        ("🚫 Ban / Unban", "admin_ban_menu"),
     ]),
 }
 ADMIN_HOME_TEXT = "🛠 <b>Admin Panel</b>\nनीचे से कैटेगरी चुनें 👇"
@@ -1008,6 +1195,7 @@ def cancel_command(message):
 
 @bot.message_handler(commands=["start"])
 def start_command(message):
+    if is_banned(message.chat.id, getattr(message.from_user, "username", None)): return
     user_id = message.chat.id
     
     if is_maintenance_mode() and not is_admin(user_id):
@@ -1125,6 +1313,7 @@ def handle_all_messages(message):
     if is_maintenance_mode() and not is_admin(user_id):
         orig_send_message(user_id, "⚠ <b>Bot is currently under maintenance.</b>\nServers are busy or undergoing updates. Please try again after some time.", parse_mode="HTML")
         return
+    if is_banned(user_id, getattr(message.from_user, "username", None)): return
     if not check_rate_limit(user_id, 1): return
     register_activity(user_id, message.message_id, "general")
 
@@ -1354,6 +1543,27 @@ def handle_all_messages(message):
                     bot.send_message(chat_id,f"✅ <b>Global Button Added! ({len(admin_data[chat_id]['buttons'])})</b>\nSend another or Finish:", reply_markup=m, parse_mode="HTML")
                 except Exception: bot.send_message(chat_id,"❌ Format error. <code>Name - Link</code>", parse_mode="HTML")
             return
+        elif step in ("BAN_TARGET", "UNBAN_TARGET"):
+            tgt = message.text.strip()
+            kind, _ = parse_ban_target(tgt)
+            if not kind:
+                return bot.send_message(chat_id, "❌ सही User ID (सिर्फ़ numbers) या @username भेजें।", parse_mode="HTML")
+            if step == "UNBAN_TARGET":
+                admin_data.pop(chat_id, None)
+                try:
+                    n = unban_user(tgt)
+                    bot.send_message(chat_id, f"✅ <b>Unban हो गया।</b> ({n} record हटाए)", parse_mode="HTML")
+                except Exception as e:
+                    bot.send_message(chat_id, f"❌ {e}", parse_mode="HTML")
+                return
+            admin_data[chat_id]["ban_target"] = tgt
+            admin_data[chat_id]["step"] = "BAN_DURATION"
+            m = (InlineKeyboardMarkup()
+                 .row(InlineKeyboardButton("1 hour", callback_data="ban_dur_1"), InlineKeyboardButton("24 hours", callback_data="ban_dur_24"))
+                 .row(InlineKeyboardButton("7 days", callback_data="ban_dur_168"), InlineKeyboardButton("30 days", callback_data="ban_dur_720"))
+                 .row(InlineKeyboardButton("♾ Permanent", callback_data="ban_dur_perm")))
+            bot.send_message(chat_id, "⏱ <b>कितने समय के लिए ban करें?</b>", reply_markup=m, parse_mode="HTML")
+            return
         elif step == "SUCC_SET_TEXT":
             admin_data[chat_id]["text"] = get_formatted_text(message)
             admin_data[chat_id]["buttons"] = []
@@ -1363,13 +1573,13 @@ def handle_all_messages(message):
             return
         elif step == "SUCC_ADD_BTNS":
             txt = message.text.strip()
-            if " - " in txt:
-                try:
-                    t, u = txt.split(" - ", 1)
-                    admin_data[chat_id]["buttons"].append({"text": t.strip(), "url": u.strip()})
-                    m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish & Save", callback_data="succ_finish"))
-                    bot.send_message(chat_id,f"✅ <b>Button Added! ({len(admin_data[chat_id]['buttons'])})</b>", reply_markup=m, parse_mode="HTML")
-                except Exception: bot.send_message(chat_id,"❌ Format error. <code>Button Text - URL</code>", parse_mode="HTML")
+            try:
+                t, u, st = parse_btn_line(txt)
+                admin_data[chat_id]["buttons"].append({"text": t, "url": u, "style": st})
+                m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish & Save", callback_data="succ_finish"))
+                bot.send_message(chat_id, f"✅ <b>Button Added! ({len(admin_data[chat_id]['buttons'])})</b>", reply_markup=m, parse_mode="HTML")
+            except Exception:
+                bot.send_message(chat_id, "❌ Format: <code>Button Text - URL</code> या <code>Button Text - URL - red</code> (red / green / blue)", parse_mode="HTML")
             return
         elif step == "INTL_SET_NAME":
             b_name = message.text.strip()
@@ -1533,6 +1743,7 @@ def handle_all_messages(message):
                         if not raw_uid: continue
                         try: uid = int(raw_uid)
                         except: continue
+                        if is_banned(uid): continue  # banned यूज़र को broadcast नहीं
 
                         try:
                             if not m_items:
@@ -1591,7 +1802,7 @@ def handle_all_messages(message):
 
 # ये prefixes सिर्फ admins के लिए हैं (user-facing बटन इनमें नहीं आते)
 ADMIN_ONLY_PREFIXES = (
-    "admin_", "back_to_admin", "flash_", "gcbtn_", "succ_", "intl_", "menu_", "batch_",
+    "admin_", "ban_", "unban_", "back_to_admin", "flash_", "gcbtn_", "succ_", "intl_", "menu_", "batch_",
     "bc_", "ftl_", "offtarget_", "ctype_", "plan_", "next_price", "skip_caption",
     "skip_course_buttons", "ch_app_", "ch_can_", "man_appr_", "man_deny_",
 )
@@ -1611,6 +1822,11 @@ def handle_buttons(call):
 
     # actor = जिसने बटन दबाया (channel के बटन में chat_id channel का होता है, इसलिए from_user ज़रूरी है)
     actor = call.from_user.id
+
+    if is_banned(actor, getattr(call.from_user, "username", None)):
+        try: bot.answer_callback_query(call.id, "🚫 आप इस bot से banned हैं।", show_alert=True)
+        except Exception: pass
+        return
 
     if is_maintenance_mode() and not is_admin(actor):
         try: bot.answer_callback_query(call.id, "⚠️ Bot is currently under maintenance. Please try again later.", show_alert=True)
@@ -1721,6 +1937,29 @@ def handle_buttons(call):
                 threading.Timer(600, screenshot_timeout, args=(chat_id, oid, prompt_msg.message_id)).start()
             except Exception: pass
         threading.Thread(target=_bg_paydone, daemon=True).start()
+        return
+
+    if data == "admin_ban_menu":
+        m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚫 Ban user", callback_data="ban_start")).row(InlineKeyboardButton("✅ Unban user", callback_data="unban_start")).row(InlineKeyboardButton("🔙 Back", callback_data="back_to_admin"))
+        bot.edit_message_text("🚫 <b>Ban / Unban</b>\nUser ID या @username से ban या unban करें।", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
+        return
+    if data in ("ban_start", "unban_start"):
+        admin_data[chat_id] = {"step": "BAN_TARGET" if data == "ban_start" else "UNBAN_TARGET"}
+        bot.edit_message_text("✏️ User ID (सिर्फ़ numbers) या @username भेजें:", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+        return
+    if data.startswith("ban_dur_"):
+        tgt = admin_data.get(chat_id, {}).get("ban_target")
+        if not tgt:
+            bot.edit_message_text("❌ पहले user ID या username भेजें।", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+            return
+        code = data.replace("ban_dur_", "")
+        labels = {"1": "1 घंटे", "24": "24 घंटे", "168": "7 दिन", "720": "30 दिन", "perm": "हमेशा के लिए"}
+        try:
+            set_ban(tgt, None if code == "perm" else float(code))
+            admin_data.pop(chat_id, None)
+            bot.edit_message_text(f"🚫 <b>Ban हो गया:</b> {labels.get(code, code)}", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+        except Exception as e:
+            bot.edit_message_text(f"❌ Ban नहीं हुआ: {e}", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
         return
 
     if data.startswith("send_ss_"):
@@ -1935,7 +2174,7 @@ def handle_buttons(call):
         bot.edit_message_text("🔘 Add Buttons: <code>Button Text - URL</code>", chat_id=chat_id, message_id=msg_id, reply_markup=m, parse_mode="HTML")
     elif data == "succ_finish":
         d = admin_data.get(chat_id, {})
-        settings_col.update_one({"_id": "success_msg_cfg"}, {"$set": {"text": d.get("text", ""), "buttons": d.get("buttons", []), "updated_at": get_ist_time()}}, upsert=True)
+        settings_col.update_one({"_id": "success_msg_cfg"}, {"$set": {"text": d.get("text", ""), "between": d.get("text", ""), "buttons": d.get("buttons", []), "updated_at": get_ist_time()}}, upsert=True)
         invalidate_cache("success_msg_cfg")
         del admin_data[chat_id]
         bot.edit_message_text("🎉 <b>Settings Saved!</b>", chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
@@ -2604,6 +2843,7 @@ def api_system_settings():
             "protect_content": bool(data.get("protect_content", False)),
             "course_timer_minutes": int(data.get("course_timer_minutes", 0)),
             "order_hold_hours": max(1, int(float(data.get("order_hold_hours", 12) or 12))),
+            "first_exact_amount": bool(data.get("first_exact_amount", old_cfg.get("first_exact_amount", False))),
             "updated_at": get_ist_time()
         }
         settings_col.update_one({"_id": "system_settings"}, {"$set": doc}, upsert=True)
@@ -2614,7 +2854,7 @@ def api_system_settings():
                 msg = "✅ <b>Bot is Back Online! / बोट चालू हो गया है!</b>\n\nMaintenance is complete. You can now continue using the bot smoothly."
                 for u in users_col.find():
                     uid = u.get("user_id") or u.get("chat_id")
-                    if uid and int(uid) != ADMIN_ID:
+                    if uid and int(uid) != ADMIN_ID and not is_banned(int(uid)):
                         try:
                             orig_send_message(int(uid), msg, parse_mode="HTML")
                             time.sleep(0.04)
@@ -2632,7 +2872,8 @@ def api_system_settings():
         "auto_del_broadcasts": cfg.get("auto_del_broadcasts", True),
         "auto_del_purchases": cfg.get("auto_del_purchases", False),
         "protect_content": cfg.get("protect_content", False),
-        "course_timer_minutes": int(cfg.get("course_timer_minutes", 0))
+        "course_timer_minutes": int(cfg.get("course_timer_minutes", 0)),
+        "first_exact_amount": bool(cfg.get("first_exact_amount", False)),
     })
 
 @app.route("/dashboard/api/force-clear-chats", methods=["POST"])
@@ -2684,6 +2925,95 @@ def api_user_lookup():
         })
     return jsonify(out)
 
+def _ist_text(ts):
+    if not ts: return ""
+    return datetime.fromtimestamp(float(ts), BAN_TZ).strftime("%d %b %Y, %I:%M %p")
+
+@app.route("/dashboard/api/bans", methods=["GET", "POST"])
+@require_auth
+def api_bans():
+    if request.method == "POST":
+        d = request.json or {}
+        raw_h = d.get("hours")
+        try: hours = None if raw_h in (None, "", "perm") else float(raw_h)
+        except (TypeError, ValueError): return jsonify({"error": "Invalid duration"}), 400
+        if hours is not None and hours <= 0: return jsonify({"error": "Duration must be more than 0"}), 400
+        try: set_ban(str(d.get("target", "")), hours, str(d.get("reason", "")))
+        except ValueError as e: return jsonify({"error": str(e)}), 400
+        return jsonify({"status": "success"})
+    now = time.time()
+    out = []
+    for b in banned_col.find({}).sort("banned_at_ts", -1):
+        if not b.get("permanent") and b.get("until") and b["until"] <= now:
+            banned_col.delete_one({"_id": b["_id"]})
+            continue
+        out.append({
+            "user_id": b.get("user_id"), "username": b.get("username", ""),
+            "permanent": bool(b.get("permanent")), "until_text": _ist_text(b.get("until")),
+            "banned_at": b.get("banned_at", ""), "reason": b.get("reason", ""),
+        })
+    BAN_CACHE["ts"] = 0.0
+    return jsonify(out)
+
+@app.route("/dashboard/api/bans/remove", methods=["POST"])
+@require_auth
+def api_unban():
+    try: n = unban_user(str((request.json or {}).get("target", "")))
+    except ValueError as e: return jsonify({"error": str(e)}), 400
+    return jsonify({"status": "success", "removed": n})
+
+@app.route("/dashboard/api/courses/<course_id>/price", methods=["POST"])
+@require_auth
+def api_course_price(course_id):
+    raw = str((request.json or {}).get("amount", "")).strip()
+    try:
+        amt = float(raw)
+        if amt <= 0: raise ValueError
+    except ValueError:
+        return jsonify({"error": "Price 0 से ज़्यादा डालें"}), 400
+    amt_s = str(int(amt)) if amt.is_integer() else f"{amt:.2f}"
+    res = courses_col.update_one({"course_id": course_id}, {"$set": {"amount": amt_s}})
+    if res.matched_count == 0: return jsonify({"error": "Course नहीं मिला"}), 404
+    invalidate_cache(f"course_{course_id}")
+    return jsonify({"status": "success", "amount": amt_s})
+
+@app.route("/dashboard/api/success-msg", methods=["GET", "POST"])
+@require_auth
+def api_success_msg():
+    if request.method == "POST":
+        d = request.json or {}
+        if d.get("reset"):
+            settings_col.delete_one({"_id": "success_msg_cfg"})
+            invalidate_cache("success_msg_cfg")
+            return jsonify({"status": "success"})
+        buttons = []
+        for b in (d.get("buttons") or [])[:8]:
+            t = str(b.get("text", "")).strip()[:64]
+            u = str(b.get("url", "")).strip()
+            if not t or not (u.lower() == "close" or u.startswith("http")):
+                return jsonify({"error": f"Button '{t or '?'}': link https:// से शुरू होना चाहिए (या close)"}), 400
+            buttons.append({"text": t, "url": u, "style": str(b.get("style", "")).lower()})
+        def _clean_btn(x, default_text):
+            x = x or {}
+            return {"text": str(x.get("text", "")).strip()[:64] or default_text,
+                    "style": str(x.get("style", "")).lower(), "enabled": bool(x.get("enabled", True))}
+        between = str(d.get("between", ""))[:2000]
+        cfg = {
+            "header": str(d.get("header", ""))[:1000],
+            "between": between,
+            "body": str(d.get("body", ""))[:1000],
+            "main_btn": _clean_btn(d.get("main_btn"), "📢 Send Request"),
+            "buttons": buttons,
+            "received_text": str(d.get("received_text", ""))[:1000],
+            "received_btn": _clean_btn(d.get("received_btn"), "📺 Open Channel"),
+            "text": between,
+            "updated_at": get_ist_time(),
+        }
+        settings_col.update_one({"_id": "success_msg_cfg"}, {"$set": cfg}, upsert=True)
+        invalidate_cache("success_msg_cfg")
+        return jsonify({"status": "success"})
+    return jsonify(get_success_cfg())
+
 @app.route("/dashboard/api/purchases", methods=["DELETE"])
 @require_auth
 def api_remove_purchase():
@@ -2726,6 +3056,7 @@ def api_broadcast():
             if not raw_uid: continue
             try:
                 uid = int(raw_uid)
+                if is_banned(uid): continue  # banned यूज़र को broadcast नहीं
                 m_sent = bot.send_message(uid, msg, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
                 sent.append([uid, m_sent.message_id])
                 time.sleep(0.04)
@@ -2941,6 +3272,8 @@ main{padding:84px 18px 56px;max-width:1040px;margin:0 auto}
 .row .right{display:flex;flex-direction:column;align-items:flex-end;gap:8px;flex:none}
 .row .end{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
 .amount{font-weight:600;font-size:15px;font-variant-numeric:tabular-nums}
+.price-edit{display:flex;gap:6px;margin-top:8px;justify-content:flex-end;align-items:center}
+.price-in{width:110px;padding:6px 8px}
 .row.state-pending{box-shadow:inset 2px 0 0 var(--warn)}
 .row.state-ok{box-shadow:inset 2px 0 0 var(--ok)}
 .row.state-bad{box-shadow:inset 2px 0 0 var(--bad)}
@@ -3149,16 +3482,16 @@ function settleConfirm(v){
 /* ============ navigation ============ */
 const NAV = [
   ["Overview", [["home", "Dashboard", "users"]]],
-  ["Sales", [["orders", "Orders", "check"], ["users", "Users & purchases", "users"]]],
-  ["Store", [["courses", "Courses", "check"], ["offers", "Offers", "check"], ["logs", "Channel logs", "check"]]],
+  ["Sales", [["orders", "Orders", "check"], ["users", "Users & purchases", "users"], ["bans", "Ban list", "users"]]],
+  ["Store", [["courses", "Courses", "check"], ["delivery", "Post-purchase message", "check"], ["offers", "Offers", "check"], ["logs", "Channel logs", "check"]]],
   ["Messaging", [["broadcast", "Broadcast", "check"], ["sms", "SMS pool & trigger", "check"]]],
   ["System", [["setup", "Bot setup", "check"], ["appupdate", "App update", "check"], ["settings", "Bot settings", "check"]]],
 ];
 const TITLES = {home: "Dashboard", orders: "Orders", users: "Users & purchases", courses: "Courses", offers: "Offers",
-  logs: "Channel logs", broadcast: "Broadcast", sms: "SMS pool & trigger", settings: "Bot settings", setup: "Bot setup", search: "Search"};
+  bans: "Ban list", delivery: "Post-purchase message", logs: "Channel logs", broadcast: "Broadcast", sms: "SMS pool & trigger", settings: "Bot settings", setup: "Bot setup", search: "Search"};
 const SUBS = {home: "Overview of today's store activity.", orders: "Approve or cancel payment requests.",
   users: "Every user and the courses they bought.", courses: "Browse, inspect and remove packs.",
-  offers: "Discount links for customers.", logs: "Channel join requests.", broadcast: "Message all users, and remove sent messages.",
+  bans: "Block users by ID or @username, for a set time or forever.", delivery: "Text and buttons shown right after a payment.", offers: "Discount links for customers.", logs: "Channel join requests.", broadcast: "Message all users, and remove sent messages.",
   sms: "Bank SMS pool and manual payment trigger.", settings: "Maintenance and auto-clean options.", setup: "MongoDB link, bot token, IDs and payment details. Saving restarts the bot."};
 
 function buildNav(){
@@ -3197,6 +3530,8 @@ const SHELL = {
   sms: () => `<div class="card"><h3>Manual payment trigger</h3><p class="sub-h">If a bank SMS did not arrive, enter the exact amount (for example 50.01) and trigger it.</p>
     <div class="form-grid"><div class="field"><label>Amount</label><input id="inj-amt" placeholder="50.01" inputmode="decimal"></div>
     <div><button class="btn primary" data-act="inject">Trigger</button></div></div></div><div id="list"></div>`,
+  bans: () => `<div id="list"></div>`,
+  delivery: () => `<div id="list"></div>`,
   settings: () => `<div id="list"></div>`,
   setup: () => `<div id="list"></div>`,
 };
@@ -3216,6 +3551,8 @@ const FETCH = {
   broadcast: () => api("/dashboard/api/broadcasts"),
   sms: () => api("/dashboard/api/sms-pool"),
   settings: () => api("/dashboard/api/system-settings"),
+  bans: () => api("/dashboard/api/bans"),
+  delivery: () => api("/dashboard/api/success-msg"),
   setup: () => api("/dashboard/api/config"),
   appupdate: () => api("/dashboard/api/app-update"),
 };
@@ -3312,12 +3649,54 @@ const RENDER = {
       ${purchasesHtml(u.user_id, u.purchases)}</div>`).join("") : empty("No users found.");
   },
 
+  bans: list => {
+    const rows = list.length ? list.map(b => `<div class="row state-bad">
+      <div class="grow"><div class="title">${b.username ? "@" + esc(b.username) : "No username"} <span class="mono dim">${b.user_id != null ? "· " + esc(b.user_id) : ""}</span></div>
+        <div class="meta">${b.permanent ? "Permanent" : "Until " + esc(b.until_text)} · banned ${esc(b.banned_at)}${b.reason ? " · " + esc(b.reason) : ""}</div></div>
+      <div class="right"><div class="end"><button class="btn sm" data-act="unban" data-target="${esc(b.user_id != null ? b.user_id : "@" + b.username)}">Unban</button></div></div></div>`).join("") : empty("No banned users.");
+    $("#list").innerHTML = `<div class="card"><h3>Ban a user</h3><p class="sub-h">Enter a numeric user ID or a @username. A banned user cannot use the bot or join channels.</p>
+      <div class="form-grid">
+        <div class="field"><label>User ID or @username</label><input id="ban-target" placeholder="123456789 or @username"></div>
+        <div class="field"><label>Duration</label><select id="ban-hours"><option value="1">1 hour</option><option value="24">24 hours</option><option value="168">7 days</option><option value="720">30 days</option><option value="perm" selected>Permanent</option></select></div>
+        <div><button class="btn danger" data-act="ban-add">Ban user</button></div>
+      </div></div>
+      <div class="card"><h3>Banned users</h3>${rows}</div>`;
+  },
+
+  delivery: c => {
+    const colorOpt = cur => [["", "Default (grey)"], ["success", "Green"], ["danger", "Red"], ["primary", "Blue"]]
+      .map(([v, l]) => `<option value="${v}" ${(cur || "") === v ? "selected" : ""}>${l}</option>`).join("");
+    const btnLines = (c.buttons || []).map(b => `${b.text} - ${b.url}${b.style ? " - " + b.style : ""}`).join("\n");
+    $("#list").innerHTML = `
+      <div class="card"><h3>Message text</h3><p class="sub-h">Shown right after a payment is verified. HTML tags like &lt;b&gt; are supported.</p>
+        <div class="field"><label>Header</label><textarea id="dl-header">${esc(c.header)}</textarea></div>
+        <div class="field"><label>Text between header and body (optional)</label><textarea id="dl-between">${esc(c.between)}</textarea></div>
+        <div class="field"><label>Body (channel packs only)</label><textarea id="dl-body">${esc(c.body)}</textarea></div></div>
+      <div class="card"><h3>Main button (channel link)</h3><p class="sub-h">Opens the channel's join-request link. The link is never shown as plain text.</p>
+        <div class="toggle-row"><div class="lbl">Show main button<small>Turn off to hide it</small></div><input type="checkbox" id="dl-main-on" ${c.main_btn && c.main_btn.enabled === false ? "" : "checked"}></div>
+        <div class="form-grid" style="margin-top:12px">
+          <div class="field"><label>Button text</label><input id="dl-main-text" value="${esc(c.main_btn && c.main_btn.text)}"></div>
+          <div class="field"><label>Colour</label><select id="dl-main-style">${colorOpt(c.main_btn && c.main_btn.style)}</select></div>
+        </div></div>
+      <div class="card"><h3>Extra buttons</h3><p class="sub-h">One per line: <code>Button text - https://link - colour</code>. Colour is optional (green, red or blue). Use <code>close</code> as the link to make a button that only closes the message.</p>
+        <textarea id="dl-buttons" placeholder="Button text - https://example.com - blue">${esc(btnLines)}</textarea></div>
+      <div class="card"><h3>Request received message</h3><p class="sub-h">Sent after the join request is accepted. The earlier "send request" message is deleted.</p>
+        <div class="field"><label>Text</label><textarea id="dl-recv">${esc(c.received_text)}</textarea></div>
+        <div class="toggle-row"><div class="lbl">Show channel button<small>Uses the same channel link</small></div><input type="checkbox" id="dl-recv-on" ${c.received_btn && c.received_btn.enabled === false ? "" : "checked"}></div>
+        <div class="form-grid" style="margin-top:12px">
+          <div class="field"><label>Button text</label><input id="dl-recv-text" value="${esc(c.received_btn && c.received_btn.text)}"></div>
+          <div class="field"><label>Colour</label><select id="dl-recv-style">${colorOpt(c.received_btn && c.received_btn.style)}</select></div>
+        </div></div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap"><button class="btn ghost" data-act="reset-delivery">Reset to default</button><button class="btn primary" data-act="save-delivery">Save message</button></div>`;
+  },
+
   courses: list => {
     $("#list").innerHTML = list.length ? list.map(c => `<div class="row">
       <div class="grow"><div class="title">${esc(c.title || "Untitled")}</div>
         <div class="meta mono">${esc(c.course_id)}${c.caption ? " · " + esc(c.caption) : ""}</div>
         <div style="margin-top:8px"><span class="pill">${c.is_channel ? esc(c.channel_name || "Channel") : "Text / link"}</span></div></div>
       <div class="right"><div class="amount">₹${esc(c.amount)}</div>
+        <div class="price-edit"><input class="price-in" type="number" min="1" step="0.01" value="${esc(c.amount)}"><button class="btn sm" data-act="save-price" data-id="${esc(c.course_id)}">Save price</button></div>
         <div class="end">
           <button class="btn sm" data-act="buyers" data-id="${esc(c.course_id)}" data-title="${esc(c.title || c.course_id)}">${svg("users")}Buyers</button>
           <button class="btn danger sm" data-act="del-course" data-id="${esc(c.course_id)}">${svg("trash")}Delete</button>
@@ -3473,6 +3852,8 @@ const RENDER = {
         ${tgl("maintenance", "Maintenance", "Customers see a maintenance message", c.maintenance)}</div>
       <div class="card"><h3>Course auto-delete</h3><p class="sub-h">Content a customer opens is removed after this time.</p>
         <div class="field"><select data-setting="course_timer_minutes">${opt(c.course_timer_minutes, [[0,"Off"],[5,"5 minutes"],[10,"10 minutes"],[20,"20 minutes"],[30,"30 minutes"]])}</select></div></div>
+      <div class="card"><h3>First order amount</h3><p class="sub-h">ON: the first order gets the exact price (₹100), then ₹100.01, ₹100.02 and so on. OFF: the first order gets ₹100.01.</p>
+        ${tgl("first_exact_amount", "Start from the exact price", "Applies to new orders from now on", c.first_exact_amount)}</div>
       <div class="card"><h3>Order amount hold</h3><p class="sub-h">Paid or cancelled orders free their amount at once. An expired order keeps its amount this long, so a late payment can still be matched.</p>
         <div class="field"><select data-setting="order_hold_hours">${opt(c.order_hold_hours, [[6,"6 hours"],[12,"12 hours (default)"],[24,"24 hours"],[48,"48 hours"]])}</select></div></div>
       <div class="card"><h3>Chat auto-clear</h3><p class="sub-h">Clean up chats after a period of inactivity.</p>
@@ -3586,6 +3967,52 @@ const ACTIONS = {
     fadeRow(el);
     await api(`/dashboard/api/courses/${enc(el.dataset.id)}`, {method: "DELETE"});
     toast("Course deleted"); refresh();
+  },
+  "save-price": async el => {
+    const amt = el.closest(".row").querySelector(".price-in").value.trim();
+    if(!amt || +amt <= 0) return toast("Enter a price above 0", "err");
+    await api(`/dashboard/api/courses/${enc(el.dataset.id)}/price`, {method: "POST", body: {amount: amt}});
+    toast("Price updated"); delete cache.courses; loadView(true);
+  },
+  "ban-add": async () => {
+    const target = $("#ban-target").value.trim();
+    if(!target) return toast("Enter a user ID or @username", "err");
+    const h = $("#ban-hours").value;
+    const ok = await confirmBox({title: "Ban this user?", text: "They will not be able to use the bot or join channels until the ban ends.", okText: "Ban user"});
+    if(!ok) return;
+    await api("/dashboard/api/bans", {method: "POST", body: {target, hours: h === "perm" ? null : +h}});
+    toast("User banned"); refresh();
+  },
+  "unban": async el => {
+    const ok = await confirmBox({title: "Unban this user?", text: "They can use the bot and join channels again.", okText: "Unban", danger: false});
+    if(!ok) return;
+    fadeRow(el);
+    await api("/dashboard/api/bans/remove", {method: "POST", body: {target: el.dataset.target}});
+    toast("User unbanned"); refresh();
+  },
+  "save-delivery": async () => {
+    const parseBtns = txt => txt.split("\n").map(l => l.trim()).filter(Boolean).map(l => {
+      const p = l.split(" - ").map(s => s.trim());
+      let style = "";
+      if(p.length >= 3 && ["green", "red", "blue", "success", "danger", "primary"].includes(p[p.length - 1].toLowerCase())) style = p.pop().toLowerCase();
+      const map = {green: "success", red: "danger", blue: "primary"};
+      return {text: p.slice(0, -1).join(" - "), url: p[p.length - 1] || "", style: map[style] || style};
+    });
+    const body = {
+      header: $("#dl-header").value, between: $("#dl-between").value, body: $("#dl-body").value,
+      main_btn: {enabled: $("#dl-main-on").checked, text: $("#dl-main-text").value, style: $("#dl-main-style").value},
+      buttons: parseBtns($("#dl-buttons").value),
+      received_text: $("#dl-recv").value,
+      received_btn: {enabled: $("#dl-recv-on").checked, text: $("#dl-recv-text").value, style: $("#dl-recv-style").value},
+    };
+    await api("/dashboard/api/success-msg", {method: "POST", body});
+    toast("Message saved"); delete cache.delivery; loadView(true);
+  },
+  "reset-delivery": async () => {
+    const ok = await confirmBox({title: "Reset to default?", text: "The post-purchase message goes back to the standard text and buttons.", okText: "Reset"});
+    if(!ok) return;
+    await api("/dashboard/api/success-msg", {method: "POST", body: {reset: true}});
+    toast("Reset done"); delete cache.delivery; loadView(true);
   },
   "create-offer": async () => {
     const max = +$("#off-max").value, pu = +$("#off-peruser").value;
@@ -3744,7 +4171,7 @@ document.addEventListener("change", async e => {
     await api("/dashboard/api/system-settings", {method: "POST", body: {
       maintenance: get("maintenance"), cleanup_seconds: get("cleanup_seconds"),
       auto_del_promos: get("auto_del_promos"), auto_del_broadcasts: get("auto_del_broadcasts"),
-      auto_del_purchases: get("auto_del_purchases"), protect_content: get("protect_content"), course_timer_minutes: get("course_timer_minutes"), order_hold_hours: get("order_hold_hours"),
+      auto_del_purchases: get("auto_del_purchases"), protect_content: get("protect_content"), course_timer_minutes: get("course_timer_minutes"), order_hold_hours: get("order_hold_hours"), first_exact_amount: get("first_exact_amount"),
     }});
     delete cache.settings;
     toast("Settings saved");
