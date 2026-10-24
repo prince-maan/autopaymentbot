@@ -166,7 +166,7 @@ BTN_STYLES = {"": None, "default": None, "green": "success", "success": "success
 class StyledButton(telebot.types.InlineKeyboardButton):
     def __init__(self, text, style=None, **kwargs):
         super().__init__(text, **kwargs)
-        self.style = BTN_STYLES.get(str(style or "").strip().lower())
+        self.style = None  # रंग फ़िलहाल बंद है; बटन हमेशा default रंग के होंगे
     def to_dict(self):
         d = super().to_dict()
         if self.style: d["style"] = self.style
@@ -1349,15 +1349,15 @@ def send_custom_start_menu(chat_id):
     offer_status = "✅ Active" if active_offers > 0 else "❌ No Active Offers"
     
     cfg = get_cached_setting("start_menu")
-    markup = InlineKeyboardMarkup().row(InlineKeyboardButton("📋 View All Plans / Packs", callback_data="user_view_plans"))
-    markup.row(InlineKeyboardButton("🛍 My Purchases", callback_data="user_my_purchases_btn"))
+    markup = InlineKeyboardMarkup()
     
     if cfg:
         for b in cfg.get("buttons", []):
             b_url = b.get("url", "")
-            if b_url.lower() == "close": markup.row(InlineKeyboardButton(b["text"], callback_data="close_msg"))
-            elif b_url.startswith("http"): markup.row(InlineKeyboardButton(b["text"], url=b_url))
-            else: markup.row(InlineKeyboardButton(b["text"], callback_data=f"mainmenu_{b_url}"))
+            st = b.get("style")
+            if b_url.lower() == "close": markup.row(kbtn(b["text"], callback_data="close_msg", style=st))
+            elif b_url.startswith("http"): markup.row(kbtn(b["text"], url=b_url, style=st))
+            else: markup.row(kbtn(b["text"], callback_data=f"mainmenu_{b_url}", style=st))
         
         base_text = cfg.get("text", "👋 Welcome to our Store!")
         custom_status_footer = f"\n\n📊 <b>Your Stats:</b>\n🛒 Total Courses Bought: <b>{len(total_purchases)}</b>\n🎁 Offers Status: <b>{offer_status}</b>"
@@ -1883,7 +1883,7 @@ def handle_all_messages(message):
                 m = InlineKeyboardMarkup().row(InlineKeyboardButton("🚀 Finish & Save", callback_data="succ_finish"))
                 bot.send_message(chat_id, f"✅ <b>Button Added! ({len(admin_data[chat_id]['buttons'])})</b>", reply_markup=m, parse_mode="HTML")
             except Exception:
-                bot.send_message(chat_id, "❌ Format: <code>Button Text - URL</code> या <code>Button Text - URL - red</code> (red / green / blue)", parse_mode="HTML")
+                bot.send_message(chat_id, "❌ Format: <code>Button Text - URL</code>", parse_mode="HTML")
             return
         elif step == "INTL_SET_NAME":
             b_name = message.text.strip()
@@ -4267,9 +4267,7 @@ const RENDER = {
   },
 
   delivery: c => {
-    const colorOpt = cur => [["", "Default (grey)"], ["success", "Green"], ["danger", "Red"], ["primary", "Blue"]]
-      .map(([v, l]) => `<option value="${v}" ${(cur || "") === v ? "selected" : ""}>${l}</option>`).join("");
-    const btnLines = (c.buttons || []).map(b => `${b.text} - ${b.url}${b.style ? " - " + b.style : ""}`).join("\n");
+    const btnLines = (c.buttons || []).map(b => `${b.text} - ${b.url}`).join("\n");
     $("#list").innerHTML = `
       <div class="card"><h3>Message text</h3><p class="sub-h">Shown right after a payment is verified. HTML tags like &lt;b&gt; are supported.</p>
         <div class="field"><label>Header</label><textarea id="dl-header">${esc(c.header)}</textarea></div>
@@ -4279,16 +4277,14 @@ const RENDER = {
         <div class="toggle-row"><div class="lbl">Show main button<small>Turn off to hide it</small></div><input type="checkbox" id="dl-main-on" ${c.main_btn && c.main_btn.enabled === false ? "" : "checked"}></div>
         <div class="form-grid" style="margin-top:12px">
           <div class="field"><label>Button text</label><input id="dl-main-text" value="${esc(c.main_btn && c.main_btn.text)}"></div>
-          <div class="field"><label>Colour</label><select id="dl-main-style">${colorOpt(c.main_btn && c.main_btn.style)}</select></div>
         </div></div>
-      <div class="card"><h3>Extra buttons</h3><p class="sub-h">One per line: <code>Button text - https://link - colour</code>. Colour is optional (green, red or blue). Use <code>close</code> as the link to make a button that only closes the message.</p>
+      <div class="card"><h3>Extra buttons</h3><p class="sub-h">One per line: <code>Button text - https://link</code>. Use <code>close</code> as the link to make a button that only closes the message.</p>
         <textarea id="dl-buttons" placeholder="Button text - https://example.com - blue">${esc(btnLines)}</textarea></div>
       <div class="card"><h3>Request received message</h3><p class="sub-h">Sent after the join request is accepted. The earlier "send request" message is deleted.</p>
         <div class="field"><label>Text</label><textarea id="dl-recv">${esc(c.received_text)}</textarea></div>
         <div class="toggle-row"><div class="lbl">Show channel button<small>Uses the same channel link</small></div><input type="checkbox" id="dl-recv-on" ${c.received_btn && c.received_btn.enabled === false ? "" : "checked"}></div>
         <div class="form-grid" style="margin-top:12px">
           <div class="field"><label>Button text</label><input id="dl-recv-text" value="${esc(c.received_btn && c.received_btn.text)}"></div>
-          <div class="field"><label>Colour</label><select id="dl-recv-style">${colorOpt(c.received_btn && c.received_btn.style)}</select></div>
         </div></div>
       <div style="display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap"><button class="btn ghost" data-act="reset-delivery">Reset to default</button><button class="btn primary" data-act="save-delivery">Save message</button></div>`;
   },
@@ -4562,7 +4558,7 @@ async function saveMenuButton(again){
     const i = line.lastIndexOf(" - ");
     const lt = i > 0 ? line.slice(0, i).trim() : "", lu = i > 0 ? line.slice(i + 3).trim() : "";
     if(!lt || !lu.startsWith("https://")) return toast("Each link line: Text - https://link", "err");
-    links.push({text: lt, url: lu, style: ""});
+    links.push({text: lt, url: lu});
   }
   if(links.length > 8) return toast("Maximum 8 link buttons per message", "err");
   const list = ((cache.menu && cache.menu.buttons) || []).concat([{text: name, action: "message", value: text, links}]);
@@ -4628,17 +4624,15 @@ const ACTIONS = {
   "save-delivery": async () => {
     const parseBtns = txt => txt.split("\n").map(l => l.trim()).filter(Boolean).map(l => {
       const p = l.split(" - ").map(s => s.trim());
-      let style = "";
-      if(p.length >= 3 && ["green", "red", "blue", "success", "danger", "primary"].includes(p[p.length - 1].toLowerCase())) style = p.pop().toLowerCase();
-      const map = {green: "success", red: "danger", blue: "primary"};
-      return {text: p.slice(0, -1).join(" - "), url: p[p.length - 1] || "", style: map[style] || style};
+      if(p.length >= 3 && ["green", "red", "blue"].includes(p[p.length - 1].toLowerCase())) p.pop();
+      return {text: p.slice(0, -1).join(" - "), url: p[p.length - 1] || ""};
     });
     const body = {
       header: $("#dl-header").value, between: $("#dl-between").value, body: $("#dl-body").value,
-      main_btn: {enabled: $("#dl-main-on").checked, text: $("#dl-main-text").value, style: $("#dl-main-style").value},
+      main_btn: {enabled: $("#dl-main-on").checked, text: $("#dl-main-text").value},
       buttons: parseBtns($("#dl-buttons").value),
       received_text: $("#dl-recv").value,
-      received_btn: {enabled: $("#dl-recv-on").checked, text: $("#dl-recv-text").value, style: $("#dl-recv-style").value},
+      received_btn: {enabled: $("#dl-recv-on").checked, text: $("#dl-recv-text").value},
     };
     await api("/dashboard/api/success-msg", {method: "POST", body});
     toast("Message saved"); delete cache.delivery; loadView(true);
