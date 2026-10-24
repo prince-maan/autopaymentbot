@@ -838,7 +838,17 @@ def esc_html(s):
 def get_menu_cfg():
     saved = get_cached_setting("menu_cfg") or {}
     btns = saved.get("buttons") if isinstance(saved.get("buttons"), list) else MENU_DEFAULT
-    return [b for b in btns if b.get("text")]
+    btns = [b for b in btns if b.get("text")]
+    if not saved.get("my_orders_removed") and not any(b.get("action") == "my_orders" for b in btns):
+        btns = [dict(MENU_DEFAULT[0])] + btns
+    return btns
+
+def save_menu_buttons(buttons):
+    """Saves the full bottom-menu list. Remembers if the owner removed My Orders on purpose."""
+    removed = not any(b.get("action") == "my_orders" for b in buttons)
+    settings_col.update_one({"_id": "menu_cfg"},
+        {"$set": {"buttons": buttons, "my_orders_removed": removed, "updated_at": get_ist_time()}}, upsert=True)
+    invalidate_cache("menu_cfg")
 
 def menu_markup():
     btns = get_menu_cfg()
@@ -1855,8 +1865,7 @@ def handle_all_messages(message):
             body = admin_data[chat_id].get("mbtn_text", "")
             admin_data.pop(chat_id, None)
             buttons = get_menu_cfg() + [{"text": name, "action": "message", "value": body, "links": links}]
-            settings_col.update_one({"_id": "menu_cfg"}, {"$set": {"buttons": buttons, "updated_at": get_ist_time()}}, upsert=True)
-            invalidate_cache("menu_cfg")
+            save_menu_buttons(buttons)
             bot.send_message(chat_id, f"✅ <b>Button added:</b> {esc_html(name)} ({len(links)} link button{'s' if len(links) != 1 else ''})", parse_mode="HTML")
             return
         elif step == "SUCC_SET_TEXT":
@@ -2247,8 +2256,7 @@ def handle_buttons(call):
         buttons = get_menu_cfg()
         if 0 <= idx < len(buttons):
             removed = buttons.pop(idx)
-            settings_col.update_one({"_id": "menu_cfg"}, {"$set": {"buttons": buttons, "updated_at": get_ist_time()}}, upsert=True)
-            invalidate_cache("menu_cfg")
+            save_menu_buttons(buttons)
             bot.answer_callback_query(call.id, f"Deleted: {removed.get('text', '')}")
         show_menu_btns(chat_id, msg_id)
         return
@@ -3463,7 +3471,9 @@ def api_menu_config():
                     "share_link": link, "updated_at": get_ist_time()}
 
     menu_set = {"updated_at": get_ist_time()}
-    if buttons is not None: menu_set["buttons"] = buttons
+    if buttons is not None:
+        menu_set["buttons"] = buttons
+        menu_set["my_orders_removed"] = not any(b.get("action") == "my_orders" for b in buttons)
     if "footer" in d: menu_set["footer"] = str(d.get("footer") or "")[:300]
     settings_col.update_one({"_id": "menu_cfg"}, {"$set": menu_set}, upsert=True)
     invalidate_cache("menu_cfg")
