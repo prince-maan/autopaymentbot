@@ -413,7 +413,13 @@ def register_activity(chat_id, message_id=None, msg_type="general"):
             user_inactivity_timers[chat_id] = new_timer
             new_timer.start()
 
-orig_send_message = bot.send_message
+_raw_send_message = bot.send_message
+def orig_send_message(chat_id, text, *args, **kwargs):
+    """खाली (अदृश्य) मैसेज Telegram रद्द करे तो 👇 से दोबारा भेजता है, ताकि बॉट कभी न रुके"""
+    try: return _raw_send_message(chat_id, text, *args, **kwargs)
+    except Exception:
+        if text == CARRIER_TEXT: return _raw_send_message(chat_id, "👇", *args, **kwargs)
+        raise
 orig_send_photo = bot.send_photo
 orig_send_video = bot.send_video
 orig_send_document = bot.send_document
@@ -832,6 +838,10 @@ def expire_qr(chat_id, message_id, course_id, amount_key, order_id):
 # ==========================================
 # बटन वाले मैसेज के लिए खाली (अदृश्य) टेक्स्ट, ताकि 👇 न दिखे
 CARRIER_TEXT = "\u200b"
+def send_carrier(chat_id, **kwargs):
+    try: return bot.send_message(chat_id, CARRIER_TEXT, **kwargs)
+    except Exception:
+        return bot.send_message(chat_id, "👇", **kwargs)
 MENU_DEFAULT = [{"text": "📦 My Orders", "action": "my_orders", "value": ""}]
 
 def esc_html(s):
@@ -1556,7 +1566,7 @@ def start_command(message):
                             register_activity(user_id, m.message_id, "course")
                             sent_mids.append(m.message_id)
                         if btns or any(i["type"] == "text" for i in m_items): 
-                            msg = bot.send_message(user_id, CARRIER_TEXT, reply_markup=markup, parse_mode="HTML", msg_type="course")
+                            msg = send_carrier(user_id, reply_markup=markup, parse_mode="HTML", msg_type="course")
                             if msg: sent_mids.append(msg.message_id)
                     except Exception as e: bot.send_message(user_id, f"❌ Error: {e}", msg_type="general")
                 
