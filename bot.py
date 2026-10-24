@@ -830,6 +830,8 @@ def expire_qr(chat_id, message_id, course_id, amount_key, order_id):
 # ==========================================
 # 📱 BOTTOM MENU + MY ORDERS + LIVE FEED
 # ==========================================
+# बटन वाले मैसेज के लिए खाली (अदृश्य) टेक्स्ट, ताकि 👇 न दिखे
+CARRIER_TEXT = "\u200b"
 MENU_DEFAULT = [{"text": "📦 My Orders", "action": "my_orders", "value": ""}]
 
 def esc_html(s):
@@ -870,14 +872,14 @@ def handle_menu_action(user_id, btn, first_name):
         send_my_orders(user_id, first_name)
     elif act == "link" and str(btn.get("value", "")).startswith("http"):
         m = InlineKeyboardMarkup().row(kbtn(btn["text"], url=btn["value"]))
-        orig_send_message(user_id, "👇", reply_markup=m)
+        orig_send_message(user_id, CARRIER_TEXT, reply_markup=m)
     elif act == "message":
         markup = None
         links = [l for l in (btn.get("links") or []) if str(l.get("url", "")).startswith("http")]
         if links:
             markup = InlineKeyboardMarkup()
             for l in links[:8]: markup.row(kbtn(l.get("text") or "Open", url=l["url"], style=l.get("style")))
-        body = btn.get("value") or "👇"
+        body = btn.get("value") or CARRIER_TEXT
         try: orig_send_message(user_id, body, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
         except Exception: orig_send_message(user_id, re.sub(r"<[^>]*>", "", body), reply_markup=markup, disable_web_page_preview=True)
 
@@ -1463,7 +1465,7 @@ def start_command(message):
     register_activity(user_id, message.message_id, "general")
     
     mk = menu_markup()
-    if mk: orig_send_message(user_id, "👇", reply_markup=mk)
+    if mk: orig_send_message(user_id, CARRIER_TEXT, reply_markup=mk)
 
     def _bg_start():
         try: users_col.update_one({"user_id": user_id}, {"$set": {"user_id": user_id, "username": message.from_user.username or "", "updated_at": get_ist_time()}}, upsert=True)
@@ -1554,7 +1556,7 @@ def start_command(message):
                             register_activity(user_id, m.message_id, "course")
                             sent_mids.append(m.message_id)
                         if btns or any(i["type"] == "text" for i in m_items): 
-                            msg = bot.send_message(user_id, "👇", reply_markup=markup, parse_mode="HTML", msg_type="course")
+                            msg = bot.send_message(user_id, CARRIER_TEXT, reply_markup=markup, parse_mode="HTML", msg_type="course")
                             if msg: sent_mids.append(msg.message_id)
                     except Exception as e: bot.send_message(user_id, f"❌ Error: {e}", msg_type="general")
                 
@@ -2052,7 +2054,7 @@ def handle_all_messages(message):
                         try:
                             if not m_items:
                                 if m:
-                                    msg = orig_send_message(uid, "👇", reply_markup=m, parse_mode="HTML", disable_web_page_preview=True)
+                                    msg = orig_send_message(uid, CARRIER_TEXT, reply_markup=m, parse_mode="HTML", disable_web_page_preview=True)
                                     register_activity(uid, msg.message_id, "broadcast")
                                     if hrs > 0: delete_list.append((uid, msg.message_id))
                                     success += 1
@@ -2071,7 +2073,7 @@ def handle_all_messages(message):
                                 sent = orig_send_media_group(uid, m_group)
                                 sent_ids.extend([s.message_id for s in sent])
                                 if m or any(i["type"] == "text" for i in m_items): 
-                                    msg = orig_send_message(uid, "👇", reply_markup=m, parse_mode="HTML", disable_web_page_preview=True)
+                                    msg = orig_send_message(uid, CARRIER_TEXT, reply_markup=m, parse_mode="HTML", disable_web_page_preview=True)
                                     sent_ids.append(msg.message_id)
                                     
                             for mid in sent_ids:
